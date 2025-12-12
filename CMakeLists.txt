@@ -37,4 +37,5 @@ endfunction()
 
 add_subdirectory(pico-extras)
 add_subdirectory(test_pattern)
+add_subdirectory(program_flash)
 
