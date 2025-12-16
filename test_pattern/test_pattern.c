@@ -20,6 +20,8 @@
 #include "text.h"
 #include "userio.h"
 
+const char *RELEASE = "1.1.0";
+
 // Location in flash for the Timing settings
 // the size of the program stored on flash is about 100K
 // You can check this by looking at the value of MIN_FLASH_OFFSET
@@ -34,7 +36,7 @@ static volatile bool wait_for_flash = false;
 
 //#define video_mode vga_mode_640x480_60_clk
 
-typedef enum { black, blue, cyan, green,  yellow, red, magenta,  white, custom, bars, border, text,  animate, grey, max_pattern} Pattern;
+typedef enum { black, blue, cyan, green,  yellow, red, magenta,  white, custom, bars, border, text,  animate, grey, lines, box, max_pattern} Pattern;
 
 //PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN ??
 //PICO_SCANVIDEO_ENABLE_DEN_PIN
@@ -183,7 +185,9 @@ const char* pattern_to_string(Pattern pattern){
         case border: return "border";
         case text: return "text";
         case animate: return "animate";
-        case custom: return "Custom";
+        case custom: return "custom";
+        case lines: return "lines";
+        case box: return "box";
         default: return "unknown";
     }
 }
@@ -567,21 +571,23 @@ void print_help()
 {
     puts("Test screens:\r\n"
          "  SPACE: cycle patterns\r\n"
-         "  r: red\r\n"
-         "  g: green\r\n"
-         "  b: blue\r\n"
-         "  c: cyan\r\n"
-         "  m: magenta\r\n"
-         "  y: yellow\r\n"
-         "  w: white\r\n"
-         "  k: black\r\n"
-         "  s: color stripes\r\n"
-         "  e: border along edge\r\n"
-         "  t: text test\r\n"
-         "  a: animate\r\n"
-         "  q: grey shades\r\n"
-         "  n: new custom color\r\n"
-         "  p: program new video timings"
+         "  r: (R)ed\r\n"
+         "  g: (G)reen\r\n"
+         "  b: (B)lue\r\n"
+         "  c: (C)yan\r\n"
+         "  m: (M)agenta\r\n"
+         "  y: (Y)ellow\r\n"
+         "  w: (W)hite\r\n"
+         "  k: blac(K)\r\n"
+         "  s: color (S)tripes\r\n"
+         "  e: border along (E)dge\r\n"
+         "  t: (T)ext test\r\n"
+         "  a: (A)nimate\r\n"
+         "  3: (3)2 grey shades\r\n"
+         "  n: (N)ew custom color\r\n"
+         "  l: 5x5 grid of white (L)ines\r\n"
+         "  x: white bo(X) on black screen\r\n"
+         "  p: (P)rogram new video timings\r\n"
          );
 }
 
@@ -608,8 +614,10 @@ int main(void) {
     busy_wait_ms(100);
     gpio_put(PICO_DEFAULT_LED_PIN,false);
 
+    printf("\r\vPico LCD Test Pattern Generator Version %s\r\n",RELEASE);
+
     uint32_t clk = clock_get_hz(clk_sys);
-    printf("default sysclk = %dHz\r\n",clk);
+    printf("Default sysclk = %dHz\r\n",clk);
 
     uint32_t sysClkKHz;
 
@@ -704,6 +712,7 @@ int main(void) {
                 pattern = text;
                 break;
             case 'q':
+            case '3':
                 pattern = grey;
                 break;
             case 'a':
@@ -712,6 +721,12 @@ int main(void) {
             case 'n':
                 pattern = custom;
                 get_custom_color(&custom_red,&custom_green,&custom_blue);
+                break;
+            case 'l':
+                pattern = lines;
+                break;
+            case 'x':
+                pattern = box;
                 break;
             case 'p':
                 program_video_timing();
@@ -885,6 +900,53 @@ void draw_border(scanvideo_scanline_buffer_t *scanline_buffer)
         // black pixel to end line
         *p++ = COMPOSABLE_RAW_1P;
         *p++ = 0;
+
+        // end of line with alignment padding
+        if (((uintptr_t)p) & 3)
+        {
+            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+            *p++ = 0;
+        }
+        else
+        {
+            *p++ = COMPOSABLE_EOL_ALIGN;
+            *p++ = 0;
+        }
+
+        scanline_buffer->data_used = ((uint32_t *)p) - scanline_buffer->data;
+        assert(scanline_buffer->data_used < scanline_buffer->data_max);
+
+        scanline_buffer->status = SCANLINE_OK;
+    }
+}
+
+// Black screen with 5x5 grid squares
+void draw_grid(scanvideo_scanline_buffer_t *scanline_buffer)
+{
+    
+    uint line_num = scanvideo_scanline_number(scanline_buffer->scanline_id);
+    
+    int vspacing = video_mode.height / 5;
+    int hspacing = video_mode.width / 5;
+    if ( (line_num % vspacing == 0) && (line_num > 0) && (line_num < vspacing*5)) {
+        draw_color_line(scanline_buffer, pattern_to_color(white));
+    } 
+    else
+    {
+        uint16_t *p = (uint16_t *)scanline_buffer->data;
+        
+        for (int i=0;i<4;i++)
+        {
+        *p++ = COMPOSABLE_COLOR_RUN;
+        *p++ = pattern_to_color(black);
+        *p++ = hspacing-3;
+        *p++ = COMPOSABLE_RAW_1P;
+        *p++ = pattern_to_color(white);
+        }
+
+        *p++ = COMPOSABLE_COLOR_RUN;
+        *p++ = pattern_to_color(black);
+        *p++ = video_mode.width - (4*(hspacing+1)) -4;
 
         // end of line with alignment padding
         if (((uintptr_t)p) & 3)
@@ -1084,7 +1146,15 @@ void __time_critical_func(render_graphics)() {
                 }
             }
             draw_box(scanline_buffer, x, y, box_size, box_size, pattern_to_color((Pattern)color));
-        } 
+        }
+        else if (pattern == lines)
+        {
+            draw_grid(scanline_buffer);
+        }
+        else if (pattern == box)
+        {
+            draw_box(scanline_buffer,video_mode.width * 2/5,video_mode.height * 1/3,video_mode.width /5,video_mode.height / 3,pattern_to_color(white));
+        }
 
         scanvideo_end_scanline_generation(scanline_buffer);
     }
