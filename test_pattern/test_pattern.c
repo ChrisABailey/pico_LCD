@@ -20,6 +20,7 @@
 #include "text.h"
 #include "userio.h"
 
+#define CYCLE_BUTTON_PIN 28
 const char *RELEASE = "1.1.0";
 
 // Location in flash for the Timing settings
@@ -83,8 +84,8 @@ const scanvideo_timing_t psp_timing_480x272_60_default =
                 .h_active = 480,
                 .v_active = 272,
                 .h_front_porch = 8,
-                .h_pulse = 8,
-                .h_total = 531,
+                .h_pulse = 8, //8
+                .h_total = 530, //531
                 .h_sync_polarity = 1,
 
                 .v_front_porch = 10,
@@ -613,6 +614,10 @@ int main(void) {
     gpio_put(PICO_DEFAULT_LED_PIN,true);
     busy_wait_ms(100);
     gpio_put(PICO_DEFAULT_LED_PIN,false);
+    gpio_init(CYCLE_BUTTON_PIN);
+    gpio_set_dir(CYCLE_BUTTON_PIN,false);
+    gpio_set_pulls(CYCLE_BUTTON_PIN,true,false);
+
 
     printf("\r\vPico LCD Test Pattern Generator Version %s\r\n",RELEASE);
 
@@ -668,11 +673,21 @@ int main(void) {
 
     print_help();
 
+    bool last_button_pos=true;  
+
     while (true) {
         // prevent tearing when we change - if you're astute you'll notice this actually causes
         // a fixed tear a number of scanlines from the top. this is caused by pre-buffering of scanlines
         // and is too detailed a topic to fix here.
         scanvideo_wait_for_vblank();
+        if (last_button_pos != gpio_get(CYCLE_BUTTON_PIN))
+        {
+            last_button_pos = gpio_get(CYCLE_BUTTON_PIN);
+            if (!last_button_pos)
+            {
+                pattern = (Pattern)((pattern + 1) % max_pattern);
+            }
+        }
         int c = getchar_timeout_us(0);
         switch (c) {
             case ' ':
