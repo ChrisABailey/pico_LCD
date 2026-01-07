@@ -7,6 +7,20 @@ These also require the PICO SDK which should be pointed with the PICO_SDK_PATH e
 
 This can be added to environment or can be added in settings->extensions->CMake Tools Build Environment
 
+the settings.json file in .vscode folder looks like the following (the path may vary based on the location that the PICO SDK is stored):
+
+```json
+{
+    "cmake.environment": {
+        "PICO_SDK_PATH": "../../../pico-sdk"
+    },
+    "cmake.configureArgs": [
+        "-DPICO_PLATFORM=rp2350", 
+        "-DPICO_BOARD=pico2"
+    ]
+}
+```
+
 ## Full Applications
 
 test_pattern.c
