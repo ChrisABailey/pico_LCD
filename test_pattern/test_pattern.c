@@ -646,7 +646,6 @@ int main(void) {
     gpio_set_pulls(CYCLE_BUTTON_PIN,true,false);
 
 
-    busy_wait_ms(2000);
     printf("\r\vPico LCD Test Pattern Generator Version %s\r\n",RELEASE);
 
     uint32_t clk = clock_get_hz(clk_sys);
@@ -656,8 +655,8 @@ int main(void) {
 
     if (!gpio_get(CYCLE_BUTTON_PIN))
     {
-        printf("Button held down - clearing custom timings from flash\r\n");
-        clear_custom_timing();
+        printf("Button held down - cdelaying start by 5 seconds\r\n");
+        busy_wait_ms(5000);
     }
 
     // read video timing from flash (if they were previously stored)
