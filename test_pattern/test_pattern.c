@@ -52,7 +52,7 @@ const scanvideo_timing_t dcdu_timing_480x234_60_default =
                 .v_active = 234,
                 .h_front_porch = 5,
                 .h_pulse = 10,
-                .h_total = 520,
+                .h_total = 530,
                 .h_sync_polarity = 1,
 
                 .v_front_porch = 8,
@@ -61,7 +61,7 @@ const scanvideo_timing_t dcdu_timing_480x234_60_default =
                 .v_sync_polarity = 1,
 
                 .enable_clock = 1,
-                .clock_polarity = 0,
+                .clock_polarity = 1,
 
                 .enable_den = 1
         };
@@ -146,8 +146,8 @@ const scanvideo_mode_t ay_mode_768x256_60 =
 
 // this is the default video timing at program install
 // the default can be changed using the "P"rogram command
-scanvideo_mode_t video_mode =psp_mode_480x272_60;
-scanvideo_timing_t video_timing = psp_timing_480x272_60_default;
+scanvideo_mode_t video_mode =dcdu_mode_480x234_60;
+scanvideo_timing_t video_timing = dcdu_timing_480x234_60_default;
 volatile uint8_t custom_red=255;
 volatile uint8_t custom_green=191;
 volatile uint8_t custom_blue=8;
@@ -204,8 +204,10 @@ uint32_t SysClkForPixClk(uint32_t pixClk)
     {
     case 65000000:
         return 130000;
-        
         break;
+    case 7800000:
+        return 124800;
+        break;    
     case 8000000:
         return 128000;
         break;
@@ -279,6 +281,18 @@ void print_timing_settings(scanvideo_timing_t t, uint32_t s)
     (t.v_total-(t.v_active+ t.v_front_porch+t.v_pulse)),t.v_total,
     t.clock_polarity?'+':'-');
     //printf(" X-scale: %u, V-scale: %u \r\n\r\n",m.xscale,m.yscale);
+}
+
+// print timing mode settings
+void print_mode_settings(scanvideo_mode_t m)
+{
+    printf("Video Mode Settings:\r\n"
+    " Width: %hu pixels\r\n"
+    " Height: %hu lines\r\n"
+    " X-scale: %u\r\n"
+    " Y-scale: %u\r\n\r\n",
+    m.width, m.height,
+    m.xscale, m.yscale);
 }
 
 // This function will be called when it's safe to call flash_range_erase
@@ -375,7 +389,7 @@ bool get_custom_timing(scanvideo_timing_t *timing,int32_t*sysClkKHz)
     {
         do
         {
-            printf("\r\nSystem Clock frequency in kHz (100000 - 250000) (must be a power of 2 * pixel clock)");
+            printf("\r\nSystem Clock frequency in kHz (100000 - 250000) (must be a power of 2 * pixel clock)[%d]: ",*sysClkKHz);
 
             sys_clk=getInt(true);
             if (check_sys_clock_khz(sys_clk,&vf,&pd1,&pd2) != true)
@@ -393,25 +407,25 @@ bool get_custom_timing(scanvideo_timing_t *timing,int32_t*sysClkKHz)
 
 
 
-        printf("\r\nPixel clock frequency (in Hz): ");
+        printf("\r\nPixel clock frequency (in Hz)[%d]: ",timing->clock_freq);
         timing->clock_freq=getInt(true);
-        printf("\r\nHorizontal active pixels: ");
+        printf("\r\nHorizontal active pixels[%d]: ",timing->h_active);
         timing->h_active=getInt(true);
-        printf("\r\nVertical active pixels: ");
+        printf("\r\nVertical active pixels[%d]: ",timing->v_active);
         timing->v_active =getInt(true);
-        printf("\r\nHorizontal front porch (pixels): ");
+        printf("\r\nHorizontal front porch (pixels)[%d]: ",timing->h_front_porch);
         timing->h_front_porch=getInt(true);
-        printf("\r\nHorizontal sync pulse width (pixels): ");
+        printf("\r\nHorizontal sync pulse width (pixels)[%d]: ",timing->h_pulse);
         timing->h_pulse =getInt(true);
-        printf("\r\nHorizontal total pixels: ");
+        printf("\r\nHorizontal total pixels[%d]: ",timing->h_total);
         timing->h_total=getInt(true);
-        printf("\r\nVertical front porch (lines): ");
+        printf("\r\nVertical front porch (lines)[%d]: ",timing->v_front_porch);
         timing->v_front_porch=getInt(true);
-        printf("\r\nVertical sync pulse width (lines): ");
+        printf("\r\nVertical sync pulse width (lines)[%d]: ",timing->v_pulse);
         timing->v_pulse=getInt(true);
-        printf("\r\nVertical total lines: ");
+        printf("\r\nVertical total lines[%d]: ",timing->v_total);
         timing->v_total =getInt(true);
-        printf("\r\nClock polarity (0 or 1): ");
+        printf("\r\nClock polarity (0 or 1)[%d]: ",timing->clock_polarity);
         timing->clock_polarity =getInt(true);
 
         timing->h_sync_polarity = 1;
@@ -426,6 +440,7 @@ bool get_custom_timing(scanvideo_timing_t *timing,int32_t*sysClkKHz)
         printf("S: Save, R: Retry, C: Cancel\r\n");
         int c = stdio_getchar();
         if (c == 'S' || c == 's') {
+            *sysClkKHz = sys_clk;
             return true;
         }
         else if (c == 'C' || c == 'c') {
@@ -472,6 +487,15 @@ bool get_custom_mode(scanvideo_mode_t *mode)
     } while (true);
 }
 
+bool clear_custom_timing()
+{
+    scanvideo_timing_t *timing = (scanvideo_timing_t *)dcdu_mode_480x234_60.default_timing;
+    scanvideo_mode_t *mode = (scanvideo_mode_t *)&dcdu_mode_480x234_60;
+    printf("Clearing custom timings from Flash Memory.");
+    // write to flash
+    return update_flash_settings(timing, mode,SysClkForPixClk(timing->clock_freq),0x1DC);
+}
+
 // get video timing settings and write them to flash to be user
 // on the next program startup
 bool program_video_timing()
@@ -488,8 +512,8 @@ bool program_video_timing()
 
     const scanvideo_timing_t *timing;
     const scanvideo_mode_t *mode;
-    scanvideo_timing_t custom_timing;
-    scanvideo_mode_t custom_mode;
+    scanvideo_timing_t custom_timing = video_timing;
+    scanvideo_mode_t custom_mode = video_mode;
     uint32_t sysClkKHz;
     uint32_t flag = FLAG;
 
@@ -521,17 +545,18 @@ bool program_video_timing()
             break;
         case '5':
             // Custom timing settings
+            sysClkKHz = clock_get_hz(clk_sys)/1000;
             if (get_custom_timing(&custom_timing,&sysClkKHz )) //&& get_custom_mode(&mode)
             {
                 timing = &custom_timing;
-                custom_mode.height =timing->h_active;
-                custom_mode.width = timing->v_active;
+                custom_mode.height =timing->v_active;
+                custom_mode.width = timing->h_active;
                 custom_mode.default_timing = timing;
                 custom_mode.xscale = 1;
                 custom_mode.yscale = 1;
                 custom_mode.pio_program = &video_24mhz_composable;
                 mode = &custom_mode;
-                printf("Writing Custom timings to Flash Memory\r\n");
+                printf("Writing Custom timings to Flash Memory:\r\n");
             }
             else
             {
@@ -540,10 +565,7 @@ bool program_video_timing()
             }   
             break;
         case '6':
-            flag = 0x1DC;
-            timing = video_mode.default_timing;
-            mode = &video_mode;
-            printf("Clearing custom timings from Flash Memory.");
+            return clear_custom_timing();
             break;
         case PICO_ERROR_TIMEOUT:
         default:
@@ -552,6 +574,8 @@ bool program_video_timing()
     }
 
     // write to flash
+    print_timing_settings(*timing,sysClkKHz);
+    print_mode_settings(*mode);
     update_flash_settings(timing, mode,sysClkKHz,flag);
     return true;
 }
@@ -603,9 +627,12 @@ void get_custom_color(volatile uint8_t*red,volatile uint8_t*green,volatile uint8
     *blue=getInt(true);
 
 }
+
+/******************************************************** 
 //
 // Main Loop (runs on Core 0)
 //
+********************************************************/
 int main(void) {
     stdio_init_all();
 
@@ -619,6 +646,7 @@ int main(void) {
     gpio_set_pulls(CYCLE_BUTTON_PIN,true,false);
 
 
+    busy_wait_ms(2000);
     printf("\r\vPico LCD Test Pattern Generator Version %s\r\n",RELEASE);
 
     uint32_t clk = clock_get_hz(clk_sys);
@@ -626,11 +654,17 @@ int main(void) {
 
     uint32_t sysClkKHz;
 
+    if (!gpio_get(CYCLE_BUTTON_PIN))
+    {
+        printf("Button held down - clearing custom timings from flash\r\n");
+        clear_custom_timing();
+    }
+
     // read video timing from flash (if they were previously stored)
     if (!get_flash_settings(&video_timing,&video_mode,&sysClkKHz))
     {
         sysClkKHz = SysClkForPixClk(video_mode.default_timing->clock_freq);
-        //printf("suggested sysclk for %dHz pix Clock is %dkHz\r\n",video_mode.default_timing->clock_freq,sysClkKHz);
+        printf("suggested sysclk for %dHz pix Clock is %dkHz\r\n",video_mode.default_timing->clock_freq,sysClkKHz);
     }
 
 
@@ -644,7 +678,7 @@ int main(void) {
 
     clk = clock_get_hz(clk_sys);
     int divider= clk / video_mode.default_timing->clock_freq;
-    printf("New PixelClock = %d, sysclock=%d, clock divider=%d\r\n",video_mode.default_timing->clock_freq,clk/1000,divider);
+    printf("New PixelClock = %d, sysclock=%dkHz, clock divider=%d\r\n",video_mode.default_timing->clock_freq,clk/1000,divider);
 
 #if PICO_SCANVIDEO_ENABLE_CLOCK_PIN
 #ifndef PICO_SCANVIDEO_ENABLE_DEN_PIN
@@ -773,11 +807,11 @@ int main(void) {
 
 
 
-/*
+/*************************************************************************
  *
  * Functions below this comment all run on core 1 (rendering the screens)
  * 
- *
+ **************************************************************************
  */
 
 
@@ -1085,7 +1119,7 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
     }
 }
 
-#define box_size 50
+
 
 // This function is called for each scan line of the display
 // it is set to run on core 1 leaving core 0 to run the UI and other tasks
@@ -1096,6 +1130,8 @@ void __time_critical_func(render_graphics)() {
     static int dy=1;
     static uint16_t last_frame_num=0;
     static uint32_t color=1;
+    int box_width = video_mode.width/6;
+    int box_height = 4*video_mode.height/(6*3);
     
 
     // initialize video and interrupts on core 1
@@ -1147,20 +1183,20 @@ void __time_critical_func(render_graphics)() {
                 last_frame_num = frame_num;
                 x += dx;
                 y += dy;
-                if ((x <= 0) || (x > (video_mode.width - box_size))) 
+                if ((x <= 0) || (x > (video_mode.width - box_width))) 
                 {
                     dx = -dx;
                     x += dx;
                     color = (color+1)%(int)white + 1;
                 }
-                if ((y <= 0) || (y > (video_mode.height - box_size))) 
+                if ((y <= 0) || (y > (video_mode.height - box_height))) 
                 {
                     dy = -dy;
                     y += dy;
                     color = (color+1)%(int)white + 1;
                 }
             }
-            draw_box(scanline_buffer, x, y, box_size, box_size, pattern_to_color((Pattern)color));
+            draw_box(scanline_buffer, x, y, box_width, box_height, pattern_to_color((Pattern)color));
         }
         else if (pattern == lines)
         {
@@ -1168,7 +1204,7 @@ void __time_critical_func(render_graphics)() {
         }
         else if (pattern == box)
         {
-            draw_box(scanline_buffer,video_mode.width * 2/5,video_mode.height * 1/3,video_mode.width /5,video_mode.height / 3,pattern_to_color(white));
+            draw_box(scanline_buffer,video_mode.width * 1/3,video_mode.height * 1/3,video_mode.width /3,video_mode.height / 3,pattern_to_color(white));
         }
 
         scanvideo_end_scanline_generation(scanline_buffer);
