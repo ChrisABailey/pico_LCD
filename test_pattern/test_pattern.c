@@ -17,11 +17,12 @@
 #include "pico/flash.h"
 #include "hardware/clocks.h"
 #include "hardware/flash.h"
+#include "hardware/watchdog.h"
 #include "text.h"
 #include "userio.h"
 
 #define CYCLE_BUTTON_PIN 28
-const char *RELEASE = "1.1.0";
+const char *RELEASE = "1.1.1";
 
 // Location in flash for the Timing settings
 // the size of the program stored on flash is about 100K
@@ -50,9 +51,9 @@ const scanvideo_timing_t dcdu_timing_480x234_60_default =
 
                 .h_active = 480,
                 .v_active = 234,
-                .h_front_porch = 5,
-                .h_pulse = 10,
-                .h_total = 530,
+                .h_front_porch = 6,
+                .h_pulse = 9,
+                .h_total = 520,
                 .h_sync_polarity = 1,
 
                 .v_front_porch = 8,
@@ -61,7 +62,7 @@ const scanvideo_timing_t dcdu_timing_480x234_60_default =
                 .v_sync_polarity = 1,
 
                 .enable_clock = 1,
-                .clock_polarity = 1,
+                .clock_polarity = 0,
 
                 .enable_den = 1
         };
@@ -148,9 +149,9 @@ const scanvideo_mode_t ay_mode_768x256_60 =
 // the default can be changed using the "P"rogram command
 scanvideo_mode_t video_mode =dcdu_mode_480x234_60;
 scanvideo_timing_t video_timing = dcdu_timing_480x234_60_default;
-volatile uint8_t custom_red=255;
-volatile uint8_t custom_green=191;
-volatile uint8_t custom_blue=8;
+volatile uint8_t custom_red=239;
+volatile uint8_t custom_green=160;
+volatile uint8_t custom_blue=64;
 
 // forward refrence for render_graphics which is executed on core 1
 void render_graphics();
@@ -159,13 +160,13 @@ void render_graphics();
 uint32_t pattern_to_color(Pattern pattern){ 
     switch(pattern){
         case black: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0, 0, 0);
-        case blue: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0, 0, 0x1f);
-        case green: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0, 0x1f, 0);
-        case cyan: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0, 0x1f, 0x1f);
-        case red: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0x1f, 0, 0);
-        case magenta: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0x1f, 0, 0x1f);
-        case yellow: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0x1f, 0x1f, 0);
-        case white: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0x1f, 0x1f, 0x1f);
+        case blue: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0, 0xff);
+        case green: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0xff, 0);
+        case cyan: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0xff, 0xef);
+        case red: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0, 0);
+        case magenta: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0, 0xdf);
+        case yellow: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xef, 0);
+        case white: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xff, 0xff);
         case custom: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(custom_red, custom_green,custom_blue);
         default: return 0x0000;
     }
@@ -264,21 +265,21 @@ void print_timing_settings(scanvideo_timing_t t, uint32_t s)
     " \tActive pixels: \t%hu\r\n" 
     " \tFront porch:  \t%hu pixels\r\n"
     " \tH-Sync width: \t%hu pixels\r\n"
-    " \tBack Porch: \t(%hu) pixels\r\n"
+    " \tBack Porch (incl HS): \t(%hu) pixels\r\n"
     " \tTotal pixels: \t%hu \r\n"
     " Vertical: \r\n"
     " \tActive lines: \t%hu\r\n" 
     " \tFront porch: \t%hu lines\r\n"
     " \tV-Sync Width: \t%hu lines\r\n"
-    " \tBack Porch: \t(%hu) lines\r\n"
+    " \tBack Porch (incl VS): \t(%hu) lines\r\n"
     " \tTotal lines: \t%hu \r\n"
     " \tClock polarity: %c\r\n",
     s,
     t.clock_freq,
     t.h_active, t.h_front_porch, t.h_pulse, 
-    (t.h_total-(t.h_active+ t.h_front_porch+t.h_pulse)),t.h_total,
+    (t.h_total-(t.h_active+ t.h_front_porch)),t.h_total,
     t.v_active, t.v_front_porch, t.v_pulse, 
-    (t.v_total-(t.v_active+ t.v_front_porch+t.v_pulse)),t.v_total,
+    (t.v_total-(t.v_active+ t.v_front_porch)),t.v_total,
     t.clock_polarity?'+':'-');
     //printf(" X-scale: %u, V-scale: %u \r\n\r\n",m.xscale,m.yscale);
 }
@@ -359,7 +360,12 @@ bool __no_inline_not_in_flash_func(update_flash_settings)(const scanvideo_timing
 
     restore_interrupts(saved);
     wait_for_flash = false;
-    printf("Settings Saved. Restart board to use the new settings.\r\n");
+    printf("Settings Saved. Restarting board to use the new settings.\r\n");
+
+    // reset the board by forcing the watchdog timer to expire
+    watchdog_enable(1, 1);
+    while(1);
+
     return true;
 }
 
@@ -594,40 +600,51 @@ void print_buf(const uint8_t *buf, size_t len) {
 
 void print_help()
 {
-    puts("Test screens:\r\n"
-         "  SPACE: cycle patterns\r\n"
-         "  r: (R)ed\r\n"
-         "  g: (G)reen\r\n"
-         "  b: (B)lue\r\n"
-         "  c: (C)yan\r\n"
-         "  m: (M)agenta\r\n"
-         "  y: (Y)ellow\r\n"
-         "  w: (W)hite\r\n"
-         "  k: blac(K)\r\n"
-         "  s: color (S)tripes\r\n"
-         "  e: border along (E)dge\r\n"
-         "  t: (T)ext test\r\n"
-         "  a: (A)nimate\r\n"
-         "  3: (3)2 grey shades\r\n"
-         "  n: (N)ew custom color\r\n"
-         "  l: 5x5 grid of white (L)ines\r\n"
-         "  x: white bo(X) on black screen\r\n"
-         "  p: (P)rogram new video timings\r\n"
-         );
+    printf("Test screens:\r\n");
+    printf("  SPACE: cycle patterns\r\n");
+    printf("  r: (R)ed [%d,%d,%d]\r\n", 0xff, 0x00, 0x00);
+    printf("  g: (G)reen [%d,%d,%d]\r\n", 0x00, 0xff, 0x00);
+    printf("  b: (B)lue [%d,%d,%d]\r\n", 0x00, 0x00, 0xff);
+    printf("  c: (C)yan [%d,%d,%d]\r\n", 0x00, 0xff, 0xef);
+    printf("  m: (M)agenta [%d,%d,%d]\r\n", 0xff, 0x00, 0xdf);
+    printf("  y: (Y)ellow [%d,%d,%d]\r\n", 0xff, 0xef, 0x00);
+    printf("  w: (W)hite [%d,%d,%d]\r\n", 0xff, 0xff, 0xff);
+    printf("  u: (U)ser color [%d,%d,%d]\r\n", custom_red, custom_green, custom_blue);
+    printf("  k: blac(K)[0,0,0]\r\n");
+    printf("  s: color (S)tripes\r\n");
+    printf("  e: border along (E)dge\r\n");
+    printf("  t: (T)ext test\r\n");
+    printf("  a: (A)nimate\r\n");
+    printf("  3: (3)2 grey shades\r\n");
+    printf("  n: (N)ew user defined color\r\n");
+    printf("  l: 5x5 grid of white (L)ines\r\n");
+    printf("  x: white bo(X) on black screen\r\n");
+    printf("  p: (P)rogram new video timings\r\n");
+    printf("  z: print video clock timing\r\n");
 }
 
 void get_custom_color(volatile uint8_t*red,volatile uint8_t*green,volatile uint8_t*blue)
 {
-    printf("pick custom RGB color, currently (%d,%d,%d)\r\n",*red,*green,*blue);
-    printf("Red:");
+    printf("Choose user defined RGB color, currently (%d,%d,%d)\r\n",*red,*green,*blue);
+    printf("Red[%d]:",*red);
     *red=getInt(true);
-    printf("\r\nGreen:");
+    printf("\r\nGreen[%d]:",*green);
     *green=getInt(true);
-    printf("\r\nBlue:");
+    printf("\r\nBlue[%d]:",*blue);
     *blue=getInt(true);
 
 }
 
+void blink(int count)
+{
+    for (int i=0;i<count;i++)
+    {
+        gpio_put(PICO_DEFAULT_LED_PIN,false);
+        busy_wait_ms(200);
+        gpio_put(PICO_DEFAULT_LED_PIN,true);
+        busy_wait_ms(200);
+    }
+}
 /******************************************************** 
 //
 // Main Loop (runs on Core 0)
@@ -638,9 +655,10 @@ int main(void) {
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN,true);    
-    gpio_put(PICO_DEFAULT_LED_PIN,true);
-    busy_wait_ms(100);
-    gpio_put(PICO_DEFAULT_LED_PIN,false);
+    blink(1);
+
+    // The "cycle" button flips to the next pattern when pressed
+    // this is pin 28 on the Pico LCD board pulled up to 3.3 (so low when pressed)
     gpio_init(CYCLE_BUTTON_PIN);
     gpio_set_dir(CYCLE_BUTTON_PIN,false);
     gpio_set_pulls(CYCLE_BUTTON_PIN,true,false);
@@ -655,7 +673,7 @@ int main(void) {
 
     if (!gpio_get(CYCLE_BUTTON_PIN))
     {
-        printf("Button held down - cdelaying start by 5 seconds\r\n");
+        printf("Button held down - delaying start by 5 seconds\r\n");
         busy_wait_ms(5000);
     }
 
@@ -669,15 +687,16 @@ int main(void) {
 
     set_sys_clock_khz(sysClkKHz, true);
     // init uart now that clk_frequency has changed
-    gpio_put(PICO_DEFAULT_LED_PIN,true);
+    
     stdio_init_all();
-    busy_wait_ms(100);
+    busy_wait_ms(500);
 
     print_timing_settings(video_timing,sysClkKHz);
 
     clk = clock_get_hz(clk_sys);
     int divider= clk / video_mode.default_timing->clock_freq;
     printf("New PixelClock = %d, sysclock=%dkHz, clock divider=%d\r\n",video_mode.default_timing->clock_freq,clk/1000,divider);
+
 
 #if PICO_SCANVIDEO_ENABLE_CLOCK_PIN
 #ifndef PICO_SCANVIDEO_ENABLE_DEN_PIN
@@ -693,7 +712,6 @@ int main(void) {
     }
 #endif
 
-    gpio_put(PICO_DEFAULT_LED_PIN,true);
 
     // create a semaphore to be posted when video init is complete
     sem_init(&video_initted, 0, 1);
@@ -707,7 +725,8 @@ int main(void) {
     print_help();
 
     bool last_button_pos=true;  
-
+    busy_wait_ms(500);
+    blink(4);
     while (true) {
         // prevent tearing when we change - if you're astute you'll notice this actually causes
         // a fixed tear a number of scanlines from the top. this is caused by pre-buffering of scanlines
@@ -810,8 +829,7 @@ int main(void) {
  *
  * Functions below this comment all run on core 1 (rendering the screens)
  * 
- **************************************************************************
- */
+ **************************************************************************/
 
 
 // Draw solid horizontal line of specified color
@@ -882,6 +900,9 @@ void draw_color_bars(scanvideo_scanline_buffer_t *buffer) {
 }
 
 // draw 32 shades of grey for each color increasing from left to right
+// note the current test board bits 6-8 to the same value as but 5 so
+// it looks like there are only 16 colors displayed 
+// because xxx10000 is almost the same as xxx01111  
 void draw_color_shades(scanvideo_scanline_buffer_t *buffer) {
     // figure out 1/32 of the color value
     uint line_num = scanvideo_scanline_number(buffer->scanline_id);
@@ -1132,23 +1153,25 @@ void __time_critical_func(render_graphics)() {
     int box_width = video_mode.width/6;
     int box_height = 4*video_mode.height/(6*3);
     
-
+    blink(3);
     // initialize video and interrupts on core 1
     scanvideo_setup(&video_mode);
     scanvideo_timing_enable(true);
     sem_release(&video_initted);
 
     while (true) {
+        // if the user is updating video settings in the Flash, we need to stop
+        // the second core while the update takes place
         if(wait_for_flash)
         {
-            printf(" Video Stopped\r\n");
+            printf(" Video Paused\r\n");
 
             flash_safe_execute_core_init();
             while(wait_for_flash)
             { /* wait*/ }
             flash_safe_execute_core_deinit();
 
-            printf(" Video started\r\n");
+            printf(" Video Resumed\r\n");
         }
         scanvideo_scanline_buffer_t *scanline_buffer = scanvideo_begin_scanline_generation(true);
 
