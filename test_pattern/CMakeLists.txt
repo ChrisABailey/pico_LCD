@@ -3,10 +3,14 @@ if (TARGET pico_scanvideo_dpi)
             test_pattern.c
             )
 
-    target_compile_definitions(test_pattern 
+    target_compile_definitions(test_pattern
         PRIVATE
         PICO_SCANVIDEO_ENABLE_CLOCK_PIN=1
         PICO_SCANVIDEO_ENABLE_DEN_PIN=1
+        # RAW_RUN for a full-width (480px) bitmap needs 244 uint32_t words per
+        # scanline buffer.  The library default of 180 is too small and causes
+        # buffer overflows (and hangs) for bitmaps wider than ~350 pixels.
+        PICO_SCANVIDEO_MAX_SCANLINE_BUFFER_WORDS=256
         )
 
     set(PICO_DEFAULT_BINARY_TYPE copy_to_ram)

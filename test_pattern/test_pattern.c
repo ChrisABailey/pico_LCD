@@ -1254,19 +1254,21 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
 
         if ((x + bmp_width) < video_mode.width) {
             *p++ = COMPOSABLE_COLOR_RUN;
-            *p++ = 0;                                             //black pixel
-            *p++ = video_mode.width - (x + bmp_width)  - 3;       // length of black run (-3)
- 
+            *p++ = 0;                                             // black pixel
+            *p++ = video_mode.width - (x + bmp_width) -1 - 3;  // -1 accounts for the trailing RAW_1P
         }
-    
+
         // black pixel to end line
         *p++ = COMPOSABLE_RAW_1P;
         *p++ = 0;
 
-        // end of line with alignment padding
-        if (((uintptr_t)p) & 1)
+        // end of line with alignment padding.
+        // Per the scanvideo README: EOL_ALIGN goes in the HIGH word (p not 4-byte aligned),
+        // EOL_SKIP_ALIGN goes in the LOW word (p 4-byte aligned).  Must check bit 1 via
+        // & 3, not bit 0 — uint16_t* pointers are always 2-byte aligned so & 1 is always 0.
+        if (((uintptr_t)p) & 3)
         {
-            *p++ = COMPOSABLE_EOL_ALIGN;  // ODD number of tokens so use EOL_ALIGN which adds one more padding pixel to make the total number of pixels output even and thus word-align the next line's first token
+            *p++ = COMPOSABLE_EOL_ALIGN;
             *p++ = 0;
         }
         else
