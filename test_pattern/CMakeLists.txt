@@ -20,6 +20,6 @@ if (TARGET pico_scanvideo_dpi)
 
     pico_add_extra_outputs(test_pattern)
 
-    #pico_enable_stdio_uart(test_pattern 1)
+    pico_enable_stdio_uart(test_pattern 0)
     pico_enable_stdio_usb(test_pattern 1)
 endif ()

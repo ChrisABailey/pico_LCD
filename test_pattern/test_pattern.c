@@ -22,7 +22,7 @@
 #include "userio.h"
 
 #define CYCLE_BUTTON_PIN 28
-const char *RELEASE = "1.1.1";
+const char *RELEASE = "1.1.2";
 
 // Location in flash for the Timing settings
 // the size of the program stored on flash is about 100K
@@ -30,15 +30,78 @@ const char *RELEASE = "1.1.1";
 // this should be at the start of a 1K block (FLASH_PAGE_SIZE)
 #define LCD_SETTINGS_OFFSET (256 * 1024)
 
+// Location in flash for a user-supplied full-screen bitmap (no recompile needed).
+// The binary must be created with make_flash_bitmap.py and flashed at this offset.
+// 1 MB leaves >3 MB free for bitmap data (max needed: 640×480×2 = ~600 KB).
+#define LCD_BITMAP_OFFSET   (1024 * 1024)
+#define BITMAP_MAGIC        0x42494D50u   // "BIMP"
+
+typedef struct {
+    uint32_t magic;
+    uint16_t width;
+    uint16_t height;
+} BitmapHeader;
+
 extern char __flash_binary_end;
 #define MIN_FLASH_OFFSET ((uintptr_t) &__flash_binary_end - XIP_BASE)
 
 const uint8_t *lcd_settings_startaddr = (const uint8_t *) (XIP_BASE + LCD_SETTINGS_OFFSET);
+const uint8_t *lcd_bitmap_startaddr   = (const uint8_t *)(XIP_BASE + LCD_BITMAP_OFFSET);
 static volatile bool wait_for_flash = false;
+
+// SRAM cache for the custom bitmap.  The bitmap is copied from XIP flash into
+// this buffer once when the user selects the pattern (on Core 0, no timing
+// constraint).  Core 1 then renders from SRAM at full speed.
+//
+// Sized for PSP 480×272 — the largest display mode whose bitmap fits in SRAM
+// alongside the copy_to_ram firmware (~100 KB) and other allocations (~40 KB).
+//   480 × 272 × 2 = 261,120 bytes (~255 KB)
+//   Total SRAM: 520 KB.  Remaining after cache: ~265 KB.  Fine.
+//
+// AY 768×256 (393 KB) and VGA 640×480 (614 KB) exceed available SRAM and are
+// not supported; load_bitmap_to_sram() will print an error for those modes.
+#define BITMAP_SRAM_MAX_W  480u
+#define BITMAP_SRAM_MAX_H  272u
+static uint16_t bitmap_sram_cache[BITMAP_SRAM_MAX_W * BITMAP_SRAM_MAX_H];
+static volatile bool  bitmap_sram_valid  = false;
+static          uint16_t bitmap_cached_width  = 0;
+static          uint16_t bitmap_cached_height = 0;
 
 //#define video_mode vga_mode_640x480_60_clk
 
-typedef enum { black, blue, cyan, green,  yellow, red, magenta,  white, custom, bars, border, text,  animate, grey, lines, box, max_pattern} Pattern;
+typedef enum { black, blue, cyan, green, yellow, red, magenta, white, custom, bars, border, text, animate, grey, lines, box, custom_bitmap, max_pattern} Pattern;
+
+// Commands produced by input_get_event() — one value per user action.
+// Adding a new input source (e.g. Bluetooth serial) only requires changes
+// inside input_get_event(); the rest of main() is unaffected.
+typedef enum {
+    CMD_NONE,            // no input available
+    CMD_CYCLE,           // advance to next pattern (space or button)
+    CMD_RED,
+    CMD_GREEN,
+    CMD_BLUE,
+    CMD_WHITE,
+    CMD_BLACK,
+    CMD_CYAN,
+    CMD_MAGENTA,
+    CMD_YELLOW,
+    CMD_BARS,
+    CMD_BORDER,
+    CMD_TEXT,
+    CMD_GREY,
+    CMD_ANIMATE,
+    CMD_NEW_COLOR,       // prompt for new custom colour then select it
+    CMD_LINES,
+    CMD_BOX,
+    CMD_CUSTOM_BITMAP,   // show user bitmap stored in flash
+    CMD_PROGRAM_TIMING,  // interactive timing-programming menu
+    CMD_PRINT_TIMING,    // print current clock settings (no pattern change)
+    CMD_HELP,            // unrecognised key → print help
+} PatternCommand;
+
+// Named positions for the bitmap text pattern
+int TEXT_X = 0;
+int TEXT_Y = 1;
 
 //PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN ??
 //PICO_SCANVIDEO_ENABLE_DEN_PIN
@@ -190,6 +253,7 @@ const char* pattern_to_string(Pattern pattern){
         case custom: return "custom";
         case lines: return "lines";
         case box: return "box";
+        case custom_bitmap: return "custom bitmap";
         default: return "unknown";
     }
 }
@@ -384,6 +448,37 @@ bool get_flash_settings(scanvideo_timing_t *timing, scanvideo_mode_t *mode, uint
     mode->pio_program = &video_24mhz_composable;
     mode->default_timing = timing;
     memcpy(sysClkKHz, lcd_settings_startaddr+FLASH_PAGE_SIZE+sizeof(scanvideo_mode_t),sizeof(uint32_t));
+    return true;
+}
+
+// Copy the flash bitmap into the SRAM cache.  Called from Core 0 only; there
+// are no timing constraints here.  Returns true and sets pattern=custom_bitmap
+// on success; prints an error and returns false on failure.
+static bool load_bitmap_to_sram(void) {
+    const BitmapHeader *hdr = (const BitmapHeader *)lcd_bitmap_startaddr;
+    if (hdr->magic != BITMAP_MAGIC) {
+        printf("No custom bitmap in flash.  Use make_flash_bitmap.py to create one.\r\n");
+        return false;
+    }
+    if (hdr->width  < 3 || hdr->width  > BITMAP_SRAM_MAX_W ||
+        hdr->height == 0 || hdr->height > BITMAP_SRAM_MAX_H) {
+        printf("Custom bitmap %ux%u exceeds SRAM cache limit (%ux%u). "
+               "Re-create for a supported resolution.\r\n",
+               hdr->width, hdr->height, BITMAP_SRAM_MAX_W, BITMAP_SRAM_MAX_H);
+        return false;
+    }
+    bitmap_sram_valid = false;           // Core 1 shows black during load
+    printf("Loading %ux%u bitmap from flash into SRAM (%u KB)...\r\n",
+           hdr->width, hdr->height,
+           (unsigned)(hdr->width * hdr->height * 2 / 1024));
+    memcpy(bitmap_sram_cache,
+           lcd_bitmap_startaddr + sizeof(BitmapHeader),
+           (size_t)hdr->width * hdr->height * sizeof(uint16_t));
+    bitmap_cached_width  = hdr->width;
+    bitmap_cached_height = hdr->height;
+    __dmb();                             // ensure cache data visible before valid flag
+    bitmap_sram_valid = true;
+    printf("Done.\r\n");
     return true;
 }
 
@@ -619,6 +714,7 @@ void print_help()
     printf("  n: (N)ew user defined color\r\n");
     printf("  l: 5x5 grid of white (L)ines\r\n");
     printf("  x: white bo(X) on black screen\r\n");
+    printf("  i: custom b(I)tmap from flash\r\n");
     printf("  p: (P)rogram new video timings\r\n");
     printf("  z: print video clock timing\r\n");
 }
@@ -645,7 +741,61 @@ void blink(int count)
         busy_wait_ms(200);
     }
 }
-/******************************************************** 
+/********************************************************
+//
+// Input abstraction layer (Core 0)
+//
+// input_get_event() is the single choke-point for all user input.
+// To add Bluetooth serial (Pico 2 W / BTStack): push characters into
+// the bt_rx_char ring-buffer from the BT UART/SPP callback, then add
+// a ring-buffer drain block here alongside the existing USB path.
+//
+********************************************************/
+
+// Returns the PatternCommand corresponding to the next available input
+// event, or CMD_NONE if no input is ready.  Handles both USB-CDC serial
+// (non-blocking) and the physical cycle button (edge-detected).
+PatternCommand input_get_event(void)
+{
+    // --- GPIO button (active-low, edge-detect) ---
+    static bool last_button_state = true;   // pulled high at rest
+    bool btn = gpio_get(CYCLE_BUTTON_PIN);
+    if (btn != last_button_state) {
+        last_button_state = btn;
+        if (!btn)                           // falling edge = pressed
+            return CMD_CYCLE;
+    }
+
+    // --- USB serial (non-blocking) ---
+    // Future BT backend: drain bt_rx_char buffer here before or instead.
+    int c = getchar_timeout_us(0);
+    switch (c) {
+        case ' ':               return CMD_CYCLE;
+        case 'r':               return CMD_RED;
+        case 'g':               return CMD_GREEN;
+        case 'b':               return CMD_BLUE;
+        case 'w':               return CMD_WHITE;
+        case 'k':               return CMD_BLACK;
+        case 'c':               return CMD_CYAN;
+        case 'm':               return CMD_MAGENTA;
+        case 'y':               return CMD_YELLOW;
+        case 's':               return CMD_BARS;
+        case 'e':               return CMD_BORDER;
+        case 't':               return CMD_TEXT;
+        case 'q': case '3':     return CMD_GREY;
+        case 'a':               return CMD_ANIMATE;
+        case 'n':               return CMD_NEW_COLOR;
+        case 'l':               return CMD_LINES;
+        case 'x':               return CMD_BOX;
+        case 'i':               return CMD_CUSTOM_BITMAP;
+        case 'p':               return CMD_PROGRAM_TIMING;
+        case 'z':               return CMD_PRINT_TIMING;
+        case PICO_ERROR_TIMEOUT: return CMD_NONE;
+        default:                return CMD_HELP;
+    }
+}
+
+/********************************************************
 //
 // Main Loop (runs on Core 0)
 //
@@ -689,9 +839,20 @@ int main(void) {
     // init uart now that clk_frequency has changed
     
     stdio_init_all();
+    //while (!stdio_usb_connected()) { sleep_ms(10); }  // wait for terminal
+
     busy_wait_ms(500);
 
     print_timing_settings(video_timing,sysClkKHz);
+
+    load_bitmap_to_sram();
+    {
+        const BitmapHeader *bmp = (const BitmapHeader *)lcd_bitmap_startaddr;
+        if (bmp->magic == BITMAP_MAGIC)
+            printf("Custom bitmap in flash: %ux%u pixels\r\n", bmp->width, bmp->height);
+        else
+            printf("No custom bitmap in flash (press 'i' to show black, see README for how to add one)\r\n");
+    }
 
     clk = clock_get_hz(clk_sys);
     int divider= clk / video_mode.default_timing->clock_freq;
@@ -724,102 +885,65 @@ int main(void) {
 
     print_help();
 
-    bool last_button_pos=true;  
     busy_wait_ms(500);
     blink(4);
     while (true) {
-        // prevent tearing when we change - if you're astute you'll notice this actually causes
-        // a fixed tear a number of scanlines from the top. this is caused by pre-buffering of scanlines
-        // and is too detailed a topic to fix here.
+        // Sync to vblank to prevent a mid-frame pattern switch causing a
+        // visible tear line.  (A small tear still occurs due to scanline
+        // pre-buffering, but it is fixed in position and unobtrusive.)
         scanvideo_wait_for_vblank();
-        if (last_button_pos != gpio_get(CYCLE_BUTTON_PIN))
-        {
-            last_button_pos = gpio_get(CYCLE_BUTTON_PIN);
-            if (!last_button_pos)
-            {
+
+        PatternCommand cmd = input_get_event();
+
+        switch (cmd) {
+            case CMD_NONE:
+                continue;
+            case CMD_CYCLE:
                 pattern = (Pattern)((pattern + 1) % max_pattern);
-            }
-        }
-        int c = getchar_timeout_us(0);
-        switch (c) {
-            case ' ':
-                pattern = (Pattern)((pattern + 1) % max_pattern);
+                if (pattern == text)
+                {
+                    TEXT_X += 1;
+                }
                 break;
-            case 'r':
-                pattern = red;
-                break;
-            case 'g':
-                pattern = green;
-                break;
-            case 'b':
-                pattern = blue;
-                break;
-            case 'w':
-                pattern = white;
-                break;
-            case 'k':
-                pattern = black;
-                break;
-            case 'c':
-                pattern = cyan;
-                break;
-            case 'm':
-                pattern = magenta;
-                break;
-            case 'y':
-                pattern = yellow;
-                break;
-            case 's':
-                pattern = bars;
-                break;
-            case 'e':
-                pattern = border;
-                break;
-            case 't':
-                pattern = text;
-                break;
-            case 'q':
-            case '3':
-                pattern = grey;
-                break;
-            case 'a':
-                pattern = animate;
-                break;
-            case 'n':
+            case CMD_RED:     pattern = red;     break;
+            case CMD_GREEN:   pattern = green;   break;
+            case CMD_BLUE:    pattern = blue;    break;
+            case CMD_WHITE:   pattern = white;   break;
+            case CMD_BLACK:   pattern = black;   break;
+            case CMD_CYAN:    pattern = cyan;    break;
+            case CMD_MAGENTA: pattern = magenta; break;
+            case CMD_YELLOW:  pattern = yellow;  break;
+            case CMD_BARS:    pattern = bars;    break;
+            case CMD_BORDER:  pattern = border;  break;
+            case CMD_TEXT:    pattern = text;    break;
+            case CMD_GREY:    pattern = grey;    break;
+            case CMD_ANIMATE: pattern = animate; break;
+            case CMD_LINES:   pattern = lines;   break;
+            case CMD_BOX:           pattern = box;           break;
+            case CMD_CUSTOM_BITMAP: pattern = custom_bitmap; break;
+            case CMD_NEW_COLOR:
                 pattern = custom;
-                get_custom_color(&custom_red,&custom_green,&custom_blue);
+                get_custom_color(&custom_red, &custom_green, &custom_blue);
                 break;
-            case 'l':
-                pattern = lines;
-                break;
-            case 'x':
-                pattern = box;
-                break;
-            case 'p':
+            case CMD_PROGRAM_TIMING:
                 program_video_timing();
                 break;
-            case 'z':
+            case CMD_PRINT_TIMING: {
                 scanvideo_timing_t t;
                 scanvideo_mode_t m;
                 uint32_t s;
-                if (get_flash_settings(&t,&m,&s))
-                {
-                    print_timing_settings(t,s);
-                    continue;
-                }
+                if (get_flash_settings(&t, &m, &s))
+                    print_timing_settings(t, s);
                 else
-                {
                     printf("No custom timing stored in flash.\r\n");
-                }
-                break;
-            case PICO_ERROR_TIMEOUT:
-                break;
+                continue;   // skip the pattern echo below
+            }
+            case CMD_HELP:
             default:
                 print_help();
                 break;
         }
-        if (c != PICO_ERROR_TIMEOUT)
-            printf("Pattern: %s\r\n", pattern_to_string(pattern));
+        printf("Pattern: %s\r\n", pattern_to_string(pattern));
     }
 }
 
@@ -1017,6 +1141,10 @@ void draw_grid(scanvideo_scanline_buffer_t *scanline_buffer)
         *p++ = pattern_to_color(black);
         *p++ = video_mode.width - (4*(hspacing+1)) -4;
 
+        // final black pixel required by composable scanline format before EOL
+        *p++ = COMPOSABLE_RAW_1P;
+        *p++ = 0;
+
         // end of line with alignment padding
         if (((uintptr_t)p) & 3)
         {
@@ -1045,17 +1173,17 @@ void draw_box(scanvideo_scanline_buffer_t *scanline_buffer, uint x, uint y, uint
         if (x > 0) {
             *p++ = COMPOSABLE_COLOR_RUN;
             *p++ = 0;
-            *p++ = x - 1-3;
+            *p++ = x - 3;
         }
         // box
         *p++ = COMPOSABLE_COLOR_RUN;
         *p++ = color;
-        *p++ = width - 1-3;
-        // right blank
+        *p++ = width - 3;
+        // right blank (- 1 accounts for the mandatory trailing RAW_1P black pixel)
         if ((x + width) < video_mode.width) {
             *p++ = COMPOSABLE_COLOR_RUN;
             *p++ = 0;
-            *p++ = video_mode.width - (x + width) - 1 -3;
+            *p++ = video_mode.width - (x + width) - 1 - 3;
         }
         // black pixel to end line
         *p++ = COMPOSABLE_RAW_1P;
@@ -1084,46 +1212,66 @@ void draw_box(scanvideo_scanline_buffer_t *scanline_buffer, uint x, uint y, uint
 
 void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buffer, const uint16_t *bitmap, uint bmp_width, uint bmp_height, uint x, uint y)
 {
-
+    
     uint line_num = scanvideo_scanline_number(scanline_buffer->scanline_id);
 
     if (line_num >= y && line_num < (y + bmp_height)) 
     {
         uint16_t *p = (uint16_t *)scanline_buffer->data;
+        if (x==1)
+        {
+            // workaround for the case where the bitmap starts at x=1 which would cause the first COMPOSABLE_COLOR_RUN to be only 2 pixels wide (due to the -3 rule) and thus not emitted at all, causing the whole line to be shifted left by one pixel and end up with a black pixel at the end instead of the intended last pixel of the bitmap
+            *p++ = COMPOSABLE_RAW_1P;
+            *p++ = bitmap[(line_num - y) * bmp_width]; // color of pixel 0
+        }
+        if (x==2)
+        {
+            *p++ = COMPOSABLE_RAW_2P;
+            *p++ = 0;
+            *p++ = 0;
+        }
         // left blank
-        if (x > 0) {
+        if (x >= 3) {
             *p++ = COMPOSABLE_COLOR_RUN;
             *p++ = 0;
-            *p++ = x - 1-3;
+            *p++ = x - 3;
         }
-        // bitmap
+        // RAW_RUN encoding: count n renders n+3 pixels total (same N-3 rule as COLOR_RUN).
+        // The PIO pixel_loop runs n+1 iterations, then falls through to raw_1p which outputs
+        // one more token as a pixel before using the following token as the next PC jump.
+        // So the stream must have exactly n+2 color tokens after the count field:
+        //   - n+1 consumed by the pixel_loop  (bitmap[1] .. bitmap[n+1])
+        //   - 1 consumed by the raw_1p fall-through (bitmap[n+2] = bitmap[bmp_width-1])
+        // The token immediately after those colors is then used as the PC jump and must be a
+        // valid composable opcode (COMPOSABLE_RAW_1P or COMPOSABLE_COLOR_RUN).
         uint bmp_line = line_num - y;
         *p++ = COMPOSABLE_RAW_RUN;
-        *p++ = bitmap[bmp_line * bmp_width];
-        *p++ = bmp_width - 1-3;
-        for (uint i = 1; i < bmp_width -1; i++) {
-            *p++ = bitmap[bmp_line * bmp_width + i];
+        *p++ = bitmap[bmp_line * bmp_width];                    // color of pixel 0
+        *p++ = bmp_width - 3;                                   // n → n+3 = bmp_width pixels total
+        for (uint i = 1; i < bmp_width; i++) {                  // pixels 2..(bmp_width-1): n+1 loop tokens
+            *p++ = bitmap[bmp_line * bmp_width + i];            // color of pixel 1 to width-1
         }
 
-        // right blank
         if ((x + bmp_width) < video_mode.width) {
             *p++ = COMPOSABLE_COLOR_RUN;
-            *p++ = 0;
-            *p++ = video_mode.width - (x + bmp_width) - 1 -3;
+            *p++ = 0;                                             //black pixel
+            *p++ = video_mode.width - (x + bmp_width)  - 3;       // length of black run (-3)
+ 
         }
+    
         // black pixel to end line
         *p++ = COMPOSABLE_RAW_1P;
         *p++ = 0;
 
         // end of line with alignment padding
-        if (((uintptr_t)p) & 3)
+        if (((uintptr_t)p) & 1)
         {
-            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+            *p++ = COMPOSABLE_EOL_ALIGN;  // ODD number of tokens so use EOL_ALIGN which adds one more padding pixel to make the total number of pixels output even and thus word-align the next line's first token
             *p++ = 0;
         }
         else
         {
-            *p++ = COMPOSABLE_EOL_ALIGN;
+            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
             *p++ = 0;
         }
 
@@ -1141,94 +1289,121 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
 
 
 
-// This function is called for each scan line of the display
-// it is set to run on core 1 leaving core 0 to run the UI and other tasks
+/*************************************************************************
+ *
+ * Per-pattern draw handlers — all have the same signature so they can be
+ * stored in the pattern_handlers dispatch table below.
+ *
+ *************************************************************************/
+
+// Solid colour: reads the global `pattern` to derive the colour so that a
+// single handler covers all nine solid-colour enum values.
+static void draw_solid_color(scanvideo_scanline_buffer_t *buf) {
+    draw_color_line(buf, pattern_to_color(pattern));
+}
+
+// Text bitmap at the named position macros.
+static void draw_text_pattern(scanvideo_scanline_buffer_t *buf) {
+    draw_bitmap(buf, (const uint16_t *)textbox, text_width, text_height, TEXT_X, TEXT_Y);
+}
+
+// Centred white box — one-third of the display in each dimension.
+static void draw_box_pattern(scanvideo_scanline_buffer_t *buf) {
+    draw_box(buf,
+             video_mode.width  * 1 / 3,
+             video_mode.height * 1 / 3,
+             video_mode.width  / 3,
+             video_mode.height / 3,
+             pattern_to_color(white));
+}
+
+// Bouncing rectangle animation.  All state is kept as statics so that the
+// function is self-contained and can be called from the dispatch table.
+static void draw_animate(scanvideo_scanline_buffer_t *buf) {
+    static int x = 50, y = 50, dx = 1, dy = 1;
+    static uint16_t last_frame_num = 0;
+    static uint32_t color = 1;
+    int box_width  = video_mode.width  / 6;
+    int box_height = 4 * video_mode.height / (6 * 3);
+
+    uint16_t frame_num = scanvideo_frame_number(buf->scanline_id);
+    if (frame_num != last_frame_num) {
+        last_frame_num = frame_num;
+        x += dx;
+        y += dy;
+        if ((x <= 0) || (x > (video_mode.width - box_width))) {
+            dx = -dx;
+            x += dx;
+            color = (color + 1) % (int)white + 1;
+        }
+        if ((y <= 0) || (y > (video_mode.height - box_height))) {
+            dy = -dy;
+            y += dy;
+            color = (color + 1) % (int)white + 1;
+        }
+    }
+    draw_box(buf, x, y, box_width, box_height, pattern_to_color((Pattern)color));
+}
+
+// Custom bitmap — renders from the SRAM cache loaded by load_bitmap_to_sram().
+// Falls back to black until the cache is populated (or if no bitmap was found).
+//
+// Why SRAM and not direct XIP reads: at 31 MHz QSPI the XIP delivers ~10 MB/s.
+// A 480-pixel row (960 bytes, 60 cold cache lines) takes ~64 µs to read —
+// consuming almost the entire 66.7 µs DCDU scanline budget before a single
+// token is written, causing PIO underflows and display corruption.
+// Copying the full image once on Core 0 (no deadline) and serving from SRAM
+// reduces per-scanline bitmap access to ~2 µs.
+static void draw_flash_bitmap(scanvideo_scanline_buffer_t *buf) {
+    if (!bitmap_sram_valid) {
+        draw_color_line(buf, 0);
+        return;
+    }
+    draw_bitmap(buf, bitmap_sram_cache, bitmap_cached_width, bitmap_cached_height, 0, 0);
+}
+
+// Dispatch table indexed by the Pattern enum.  Adding a new pattern only
+// requires: a new enum value, a handler function, and an entry here.
+typedef void (*draw_fn_t)(scanvideo_scanline_buffer_t *);
+
+static const draw_fn_t pattern_handlers[max_pattern] = {
+    [black]         = draw_solid_color,
+    [blue]          = draw_solid_color,
+    [cyan]          = draw_solid_color,
+    [green]         = draw_solid_color,
+    [yellow]        = draw_solid_color,
+    [red]           = draw_solid_color,
+    [magenta]       = draw_solid_color,
+    [white]         = draw_solid_color,
+    [custom]        = draw_solid_color,
+    [bars]          = draw_color_bars,
+    [border]        = draw_border,
+    [text]          = draw_text_pattern,
+    [animate]       = draw_animate,
+    [grey]          = draw_color_shades,
+    [lines]         = draw_grid,
+    [box]           = draw_box_pattern,
+    [custom_bitmap] = draw_flash_bitmap,
+};
+
+// Core 1 entry point: initialises scanvideo then renders one scanline per
+// iteration using the pattern_handlers dispatch table.
 void __time_critical_func(render_graphics)() {
-    static int x=50;
-    static int y=50;
-    static int dx=1;
-    static int dy=1;
-    static uint16_t last_frame_num=0;
-    static uint32_t color=1;
-    int box_width = video_mode.width/6;
-    int box_height = 4*video_mode.height/(6*3);
-    
     blink(3);
-    // initialize video and interrupts on core 1
     scanvideo_setup(&video_mode);
     scanvideo_timing_enable(true);
     sem_release(&video_initted);
 
     while (true) {
-        // if the user is updating video settings in the Flash, we need to stop
-        // the second core while the update takes place
-        if(wait_for_flash)
-        {
-            printf(" Video Paused\r\n");
-
+        // Pause rendering while Core 0 performs a flash write.
+        if (wait_for_flash) {
             flash_safe_execute_core_init();
-            while(wait_for_flash)
-            { /* wait*/ }
+            while (wait_for_flash) { /* spin */ }
             flash_safe_execute_core_deinit();
-
-            printf(" Video Resumed\r\n");
-        }
-        scanvideo_scanline_buffer_t *scanline_buffer = scanvideo_begin_scanline_generation(true);
-
-        if (pattern == text) 
-        {
-            draw_bitmap(scanline_buffer, (const uint16_t *)textbox, text_width, text_height, 15, 15);
-        } 
-        else if (pattern == bars)
-        {
-            draw_color_bars(scanline_buffer);
-        } 
-        else if (pattern == border)
-        {   
-            draw_border(scanline_buffer);
-        } 
-        else if (pattern <= custom) 
-        {
-            draw_color_line(scanline_buffer, pattern_to_color(pattern));
-        } 
-        else if (pattern == grey) 
-        {
-            draw_color_shades(scanline_buffer);
-        } 
-        else if (pattern == animate) 
-        {
-            static uint16_t scanline_color = 0;
-            uint line_num = scanvideo_scanline_number(scanline_buffer->scanline_id);
-            uint16_t frame_num = scanvideo_frame_number(scanline_buffer->scanline_id);
-            if (frame_num != last_frame_num) 
-            {
-                last_frame_num = frame_num;
-                x += dx;
-                y += dy;
-                if ((x <= 0) || (x > (video_mode.width - box_width))) 
-                {
-                    dx = -dx;
-                    x += dx;
-                    color = (color+1)%(int)white + 1;
-                }
-                if ((y <= 0) || (y > (video_mode.height - box_height))) 
-                {
-                    dy = -dy;
-                    y += dy;
-                    color = (color+1)%(int)white + 1;
-                }
-            }
-            draw_box(scanline_buffer, x, y, box_width, box_height, pattern_to_color((Pattern)color));
-        }
-        else if (pattern == lines)
-        {
-            draw_grid(scanline_buffer);
-        }
-        else if (pattern == box)
-        {
-            draw_box(scanline_buffer,video_mode.width * 1/3,video_mode.height * 1/3,video_mode.width /3,video_mode.height / 3,pattern_to_color(white));
         }
 
-        scanvideo_end_scanline_generation(scanline_buffer);
+        scanvideo_scanline_buffer_t *buf = scanvideo_begin_scanline_generation(true);
+        pattern_handlers[pattern](buf);
+        scanvideo_end_scanline_generation(buf);
     }
 }
