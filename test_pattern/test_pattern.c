@@ -29,13 +29,15 @@
 #include "userio.h"
 
 #define CYCLE_BUTTON_PIN 28
-const char *RELEASE = "1.1.2";
+const char *RELEASE = "1.3.0";
 
-// Location in flash for the Timing settings
-// the size of the program stored on flash is about 100K
-// You can check this by looking at the value of MIN_FLASH_OFFSET
-// this should be at the start of a 1K block (FLASH_PAGE_SIZE)
+// Location in flash for the Timing settings.
+// For pico2 (no BT) the binary is ~130 KB so 256 KB is safe.
+// For pico2_w (with BTstack) the binary is ~440 KB, which extends past 256 KB;
+// CMakeLists.txt overrides this to 512 KB so settings don't overlap the code.
+#ifndef LCD_SETTINGS_OFFSET
 #define LCD_SETTINGS_OFFSET (256 * 1024)
+#endif
 
 // Location in flash for a user-supplied full-screen bitmap (no recompile needed).
 // The binary must be created with make_flash_bitmap.py and flashed at this offset.
@@ -601,7 +603,7 @@ bool clear_custom_timing()
     scanvideo_mode_t *mode = (scanvideo_mode_t *)&dcdu_mode_480x234_60;
     printf("Clearing custom timings from Flash Memory.");
     // write to flash
-    return update_flash_settings(timing, mode,SysClkForPixClk(timing->clock_freq),0x1DC);
+    return update_flash_settings(timing, mode,SysClkForPixClk(timing->clock_freq),FLAG);
 }
 
 // get video timing settings and write them to flash to be user
@@ -1009,10 +1011,10 @@ void draw_color_line(scanvideo_scanline_buffer_t *buffer, uint32_t color) {
 
     // end of line with alignment padding
     if (((uintptr_t)p) & 3) {
-        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+        *p++ = COMPOSABLE_EOL_ALIGN;
         *p++ = 0;
     } else {
-        *p++ = COMPOSABLE_EOL_ALIGN;
+        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
         *p++ = 0;
     }
 
@@ -1047,10 +1049,10 @@ void draw_color_bars(scanvideo_scanline_buffer_t *buffer) {
     *p++ = 0;
 
     if (((uintptr_t)p) & 3) {
-        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+        *p++ = COMPOSABLE_EOL_ALIGN;
         *p++ = 0;
     } else {
-        *p++ = COMPOSABLE_EOL_ALIGN;
+        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
         *p++ = 0;
     }
 
@@ -1134,12 +1136,12 @@ void draw_border(scanvideo_scanline_buffer_t *scanline_buffer)
         // end of line with alignment padding
         if (((uintptr_t)p) & 3)
         {
-            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+            *p++ = COMPOSABLE_EOL_ALIGN;
             *p++ = 0;
         }
         else
         {
-            *p++ = COMPOSABLE_EOL_ALIGN;
+            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
             *p++ = 0;
         }
 
@@ -1163,8 +1165,18 @@ void draw_grid(scanvideo_scanline_buffer_t *scanline_buffer)
     } 
     else
     {
+        // Guard against pathological timing modes where the display is so narrow
+        // that hspacing < 3 (COMPOSABLE_COLOR_RUN requires at least 3 pixels, so the
+        // count field = pixels - 3 would underflow), or where the final padding run
+        // would have a negative length.
+        int last_run = (int)video_mode.width - (4 * (hspacing + 1)) - 4;
+        if (hspacing < 3 || last_run < 0) {
+            draw_color_line(scanline_buffer, pattern_to_color(black));
+            return;
+        }
+
         uint16_t *p = (uint16_t *)scanline_buffer->data;
-        
+
         for (int i=0;i<4;i++)
         {
         *p++ = COMPOSABLE_COLOR_RUN;
@@ -1176,7 +1188,7 @@ void draw_grid(scanvideo_scanline_buffer_t *scanline_buffer)
 
         *p++ = COMPOSABLE_COLOR_RUN;
         *p++ = pattern_to_color(black);
-        *p++ = video_mode.width - (4*(hspacing+1)) -4;
+        *p++ = last_run;
 
         // final black pixel required by composable scanline format before EOL
         *p++ = COMPOSABLE_RAW_1P;
@@ -1185,12 +1197,12 @@ void draw_grid(scanvideo_scanline_buffer_t *scanline_buffer)
         // end of line with alignment padding
         if (((uintptr_t)p) & 3)
         {
-            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+            *p++ = COMPOSABLE_EOL_ALIGN;
             *p++ = 0;
         }
         else
         {
-            *p++ = COMPOSABLE_EOL_ALIGN;
+            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
             *p++ = 0;
         }
 
@@ -1201,25 +1213,39 @@ void draw_grid(scanvideo_scanline_buffer_t *scanline_buffer)
     }
 }
 
-void draw_box(scanvideo_scanline_buffer_t *scanline_buffer, uint x, uint y, uint width, uint height, uint32_t color)
+void draw_box(scanvideo_scanline_buffer_t *scanline_buffer, uint x, uint y, uint width, uint height, uint32_t color,uint32_t bg_color)
 {
     uint line_num = scanvideo_scanline_number(scanline_buffer->scanline_id);
     if (line_num >= y && line_num < (y + height)) {
         uint16_t *p = (uint16_t *)scanline_buffer->data;
         // left blank
-        if (x > 0) {
-            *p++ = COMPOSABLE_COLOR_RUN;
+        if (x==1)
+        {
+            *p++ = COMPOSABLE_RAW_1P;
+            *p++ = bg_color;
+        }
+        if (x==2)
+        {
+            *p++ = COMPOSABLE_RAW_2P;
+            *p++ = bg_color;
+            *p++ = bg_color;
             *p++ = 0;
+        }
+        if (x >= 3) {
+            *p++ = COMPOSABLE_COLOR_RUN;
+            *p++ = bg_color;
             *p++ = x - 3;
         }
+
         // box
         *p++ = COMPOSABLE_COLOR_RUN;
         *p++ = color;
         *p++ = width - 3;
+
         // right blank (- 1 accounts for the mandatory trailing RAW_1P black pixel)
         if ((x + width) < video_mode.width) {
             *p++ = COMPOSABLE_COLOR_RUN;
-            *p++ = 0;
+            *p++ = bg_color;
             *p++ = video_mode.width - (x + width) - 1 - 3;
         }
         // black pixel to end line
@@ -1229,12 +1255,12 @@ void draw_box(scanvideo_scanline_buffer_t *scanline_buffer, uint x, uint y, uint
         // end of line with alignment padding
         if (((uintptr_t)p) & 3)
         {
-            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+            *p++ = COMPOSABLE_EOL_ALIGN;
             *p++ = 0;
         }
         else
         {
-            *p++ = COMPOSABLE_EOL_ALIGN;
+            *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
             *p++ = 0;
         }
 
@@ -1243,7 +1269,7 @@ void draw_box(scanvideo_scanline_buffer_t *scanline_buffer, uint x, uint y, uint
 
         scanline_buffer->status = SCANLINE_OK;
     } else {
-        draw_color_line(scanline_buffer, 0);
+        draw_color_line(scanline_buffer, bg_color);
     }
 }
 
@@ -1252,14 +1278,23 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
     
     uint line_num = scanvideo_scanline_number(scanline_buffer->scanline_id);
 
-    if (line_num >= y && line_num < (y + bmp_height)) 
+    if (line_num >= y && line_num < (y + bmp_height))
     {
+        // Guard: check the worst-case token count before writing anything.
+        // Tokens: left-pad (3) + RAW_RUN header (3) + bmp_width pixels + right-fill (3) +
+        // trailing RAW_1P (2) + EOL (2) = 13 + bmp_width tokens = ceil((13 + bmp_width) / 2) 32-bit words.
+        uint estimated_words = (13u + bmp_width + 1u) / 2u;
+        if (estimated_words > scanline_buffer->data_max) {
+            draw_color_line(scanline_buffer, 0);
+            return;
+        }
+
         uint16_t *p = (uint16_t *)scanline_buffer->data;
         if (x==1)
         {
             // workaround for the case where the bitmap starts at x=1 which would cause the first COMPOSABLE_COLOR_RUN to be only 2 pixels wide (due to the -3 rule) and thus not emitted at all, causing the whole line to be shifted left by one pixel and end up with a black pixel at the end instead of the intended last pixel of the bitmap
             *p++ = COMPOSABLE_RAW_1P;
-            *p++ = bitmap[(line_num - y) * bmp_width]; // color of pixel 0
+            *p++ = 0;
         }
         if (x==2)
         {
@@ -1315,13 +1350,6 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
         }
 
         scanline_buffer->data_used = ((uint32_t *)p) - scanline_buffer->data;
-        if(scanline_buffer->data_used > scanline_buffer->data_max)
-        {
-#ifdef PICO_DEFAULT_LED_PIN
-            gpio_put(PICO_DEFAULT_LED_PIN, false);
-#endif
-        }
-
         scanline_buffer->status = SCANLINE_OK;
     } else {
         draw_color_line(scanline_buffer, 0);
@@ -1355,7 +1383,7 @@ static void draw_box_pattern(scanvideo_scanline_buffer_t *buf) {
              video_mode.height * 1 / 3,
              video_mode.width  / 3,
              video_mode.height / 3,
-             pattern_to_color(white));
+             pattern_to_color(white),pattern_to_color(black));
 }
 
 // Bouncing rectangle animation.  All state is kept as statics so that the
@@ -1364,6 +1392,7 @@ static void draw_animate(scanvideo_scanline_buffer_t *buf) {
     static int x = 50, y = 50, dx = 1, dy = 1;
     static uint16_t last_frame_num = 0;
     static uint32_t color = 1;
+    static uint32_t bg_color = 0;
     int box_width  = video_mode.width  / 6;
     int box_height = 4 * video_mode.height / (6 * 3);
 
@@ -1372,18 +1401,22 @@ static void draw_animate(scanvideo_scanline_buffer_t *buf) {
         last_frame_num = frame_num;
         x += dx;
         y += dy;
-        if ((x <= 0) || (x > (video_mode.width - box_width))) {
+        if ((x <= 1) || (x > (video_mode.width - box_width))) {
             dx = -dx;
-            x += dx;
-            color = (color + 1) % (int)white + 1;
+            //x += dx;
+            color = (color + 1) % ((int)white + 1);
         }
         if ((y <= 0) || (y > (video_mode.height - box_height))) {
             dy = -dy;
-            y += dy;
-            color = (color + 1) % (int)white + 1;
+            //y += dy;
+            color = (color + 1) % ((int)white + 1);
+            bg_color = (bg_color + 1) % ((int)(custom)+1);
+        }
+        if (bg_color == color) {
+            bg_color = (bg_color + 1) % ((int)(custom)+1);
         }
     }
-    draw_box(buf, x, y, box_width, box_height, pattern_to_color((Pattern)color));
+    draw_box(buf, x, y, box_width, box_height, pattern_to_color((Pattern)color),pattern_to_color((Pattern)bg_color));
 }
 
 // Custom bitmap — renders from the SRAM cache loaded by load_bitmap_to_sram().
@@ -1397,7 +1430,7 @@ static void draw_animate(scanvideo_scanline_buffer_t *buf) {
 // reduces per-scanline bitmap access to ~2 µs.
 static void draw_flash_bitmap(scanvideo_scanline_buffer_t *buf) {
     if (!bitmap_sram_valid) {
-        draw_color_line(buf, 0);
+        draw_box(buf, 1, 1, video_mode.width-2, video_mode.height-2, 0, pattern_to_color((Pattern)white));
         return;
     }
     draw_bitmap(buf, bitmap_sram_cache, bitmap_cached_width, bitmap_cached_height, 0, 0);

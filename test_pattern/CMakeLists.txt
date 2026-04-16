@@ -13,8 +13,18 @@ if (TARGET pico_scanvideo_dpi)
         PICO_SCANVIDEO_MAX_SCANLINE_BUFFER_WORDS=256
         )
 
-    set(PICO_DEFAULT_BINARY_TYPE copy_to_ram)
-    set(PICO_COPY_TO_RAM,1)
+    # copy_to_ram copies the entire binary into SRAM so all code runs from RAM,
+    # avoiding XIP latency during scanline rendering.  Only safe for the plain
+    # pico2 build.  The pico2_w build with BTstack Classic is ~442 KB of code +
+    # 278 KB BSS = 720 KB total, which far exceeds the RP2350's 520 KB SRAM.
+    # With copy_to_ram the C startup BSS-zeroing loop overruns SRAM, corrupting
+    # the stack; the debugger then shows a misleading backtrace pointing at
+    # stdio_init_all / tud_rhport_init even though main() never ran.
+    # Without copy_to_ram only the 278 KB BSS lives in SRAM; code runs from XIP.
+    # Time-critical rendering functions are already marked __time_critical_func.
+    if(NOT PICO_CYW43_SUPPORTED)
+        pico_set_binary_type(test_pattern copy_to_ram)
+    endif()
 
     target_link_libraries(test_pattern PRIVATE
             pico_multicore
@@ -36,6 +46,12 @@ if (TARGET pico_scanvideo_dpi)
         target_include_directories(test_pattern PRIVATE ${CMAKE_CURRENT_LIST_DIR})
         target_compile_definitions(test_pattern PRIVATE
             PICO_BT_SERIAL_ENABLED=1
+            # The pico2_w binary is ~442 KB of code in flash.  The default
+            # LCD_SETTINGS_OFFSET of 256 KB falls inside the code binary and
+            # update_flash_settings() would corrupt the firmware.  Use 512 KB
+            # instead, which is safely above the code end and below the 1 MB
+            # bitmap region.
+            LCD_SETTINGS_OFFSET=524288
         )
         target_link_libraries(test_pattern PRIVATE
             # pico_cyw43_arch_none: CYW43 driver WITHOUT lwIP (sets CYW43_LWIP=0).
