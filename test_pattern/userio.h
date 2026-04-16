@@ -6,9 +6,17 @@
 const char BACKSPACE = 127;
 
 unsigned char mygetchar() {
-	int c;
-	while ( (c = getchar_timeout_us(0)) < 0); 
-	return (unsigned char)c;
+    int c;
+    do {
+        c = getchar_timeout_us(0);
+        // Pico 2 W: also poll the Bluetooth RX ring buffer so interactive menus
+        // (getString, getFloat, getInt) work transparently over BT serial.
+        // bt_serial_getchar() is defined in bt_serial.h, included before userio.h.
+#if defined(PICO_BT_SERIAL_ENABLED)
+        if (c < 0) c = bt_serial_getchar();
+#endif
+    } while (c < 0);
+    return (unsigned char)c;
 };
 
 int getString(char *line, int bufLen, bool echo ) {

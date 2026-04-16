@@ -1,0 +1,44 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "pico2",
+            "displayName": "Pico 2",
+            "description": "RP2350 Pico 2 — USB serial only, no Bluetooth",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build-pico2",
+            "cacheVariables": {
+                "PICO_PLATFORM": "rp2350",
+                "PICO_BOARD":    "pico2",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "pico2_w",
+            "displayName": "Pico 2 W (Bluetooth)",
+            "description": "RP2350 Pico 2 W — USB + Bluetooth SPP serial",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build-pico2w",
+            "cacheVariables": {
+                "PICO_PLATFORM": "rp2350",
+                "PICO_BOARD":    "pico2_w",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "pico2",
+            "displayName": "Pico 2",
+            "configurePreset": "pico2"
+        },
+        {
+            "name": "pico2_w",
+            "displayName": "Pico 2 W (Bluetooth)",
+            "configurePreset": "pico2_w"
+        }
+    ]
+}

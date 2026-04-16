@@ -7,19 +7,86 @@ These also require the PICO SDK which should be pointed with the PICO_SDK_PATH e
 
 This can be added to environment or can be added in settings->extensions->CMake Tools Build Environment
 
-the settings.json file in .vscode folder looks like the following (the path may vary based on the location that the PICO SDK is stored):
+The `.vscode/settings.json` file only needs to set the SDK path — board selection is handled via CMake presets (see below):
 
 ```json
 {
     "cmake.environment": {
         "PICO_SDK_PATH": "../../../pico-sdk"
-    },
-    "cmake.configureArgs": [
-        "-DPICO_PLATFORM=rp2350", 
-        "-DPICO_BOARD=pico2"
-    ]
+    }
 }
 ```
+
+## Build Variants
+
+Two build variants are defined in `CMakePresets.json`:
+
+| Preset | Target hardware | Build directory | Bluetooth |
+|--------|----------------|----------------|-----------|
+| `pico2` | Raspberry Pi Pico 2 (RP2350) | `build-pico2/` | No |
+| `pico2_w` | Raspberry Pi Pico 2 W (RP2350 + CYW43) | `build-pico2w/` | Yes |
+
+**VS Code**: select the active variant using the CMake Tools status bar at the bottom of the window ("Pico 2" or "Pico 2 W (Bluetooth)").
+
+**Command line**:
+```bash
+# Pico 2 — USB serial only
+cmake --preset pico2 && cmake --build --preset pico2
+
+# Pico 2 W — USB + Bluetooth Classic SPP
+cmake --preset pico2_w && cmake --build --preset pico2_w
+```
+
+Flash the resulting `.uf2` from `build-pico2/test_pattern/` or `build-pico2w/test_pattern/` respectively.
+
+## Bluetooth Serial Interface (Pico 2 W)
+
+When running on a Pico 2 W, the firmware advertises a **Bluetooth Classic SPP** (Serial Port Profile) connection named `PicoLCD`. This works exactly like the USB serial connection — all commands, interactive menus, and debug output are available over either interface simultaneously.
+
+### Pairing
+
+1. Power on the Pico 2 W with the `pico2_w` firmware flashed.
+2. On your computer, open Bluetooth settings and scan for new devices.
+3. Select **PicoLCD** from the list. Pairing completes automatically with no PIN or confirmation prompt (Just Works).
+
+### Connecting on macOS
+
+After pairing, a serial port appears under `/dev/`:
+
+```bash
+ls /dev/cu.PicoLCD*
+# e.g. /dev/cu.PicoLCD-SerialPort
+```
+
+Connect with any terminal emulator:
+
+```bash
+screen /dev/cu.PicoLCD-SerialPort 115200
+# or
+picocom /dev/cu.PicoLCD-SerialPort -b 115200
+```
+
+> **Note:** Use `/dev/cu.*` (not `/dev/tty.*`) on macOS. The `cu` device opens without waiting for a carrier signal, which is correct for Bluetooth SPP.
+
+### Connecting on Linux
+
+```bash
+# Bind the device (use hcitool scan first if address is unknown)
+sudo rfcomm bind 0 XX:XX:XX:XX:XX:XX
+picocom /dev/rfcomm0 -b 115200
+```
+
+### Connecting on Windows
+
+After pairing in Bluetooth settings, a COM port is assigned (e.g. `COM5`). Connect with PuTTY, TeraTerm, or any serial terminal at 115200 baud.
+
+### Notes
+
+- USB serial and Bluetooth are active simultaneously — disconnect one without affecting the other.
+- On the very first boot after flashing, BTstack initialises its flash key store, which takes a moment. Subsequent boots are faster.
+- If the device does not appear during scan, ensure the firmware is running (USB serial should be printing the startup banner).
+
+---
 
 ## Full Applications
 
@@ -107,7 +174,7 @@ The firmware reports at startup whether a valid bitmap is present:
 Custom bitmap in flash: 480x234 pixels
 ```
 
-If the stored bitmap width does not match the current display width the
+If the stored bitmap width is larger than the current display width the
 pattern falls back to a black screen.  Reflash a correctly-sized bitmap
 after changing the display timing mode.
 

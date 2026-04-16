@@ -19,6 +19,13 @@
 #include "hardware/flash.h"
 #include "hardware/watchdog.h"
 #include "text.h"
+// bt_serial.h must be included before userio.h: userio.h's mygetchar() calls
+// bt_serial_getchar(), so the declaration must be visible first.
+#if defined(PICO_BT_SERIAL_ENABLED)
+#include "pico/cyw43_arch.h"
+#include "btstack.h"
+#include "bt_serial.h"
+#endif
 #include "userio.h"
 
 #define CYCLE_BUTTON_PIN 28
@@ -735,9 +742,16 @@ void blink(int count)
 {
     for (int i=0;i<count;i++)
     {
+        // Pico 2 W: PICO_DEFAULT_LED_PIN is not a GPIO — the LED is driven
+        // through the CYW43 chip.  Calling CYW43 from Core 1 is not safe, so
+        // we keep the timing delay but skip the toggle on W boards.
+#ifdef PICO_DEFAULT_LED_PIN
         gpio_put(PICO_DEFAULT_LED_PIN,false);
+#endif
         busy_wait_ms(200);
+#ifdef PICO_DEFAULT_LED_PIN
         gpio_put(PICO_DEFAULT_LED_PIN,true);
+#endif
         busy_wait_ms(200);
     }
 }
@@ -767,8 +781,14 @@ PatternCommand input_get_event(void)
     }
 
     // --- USB serial (non-blocking) ---
-    // Future BT backend: drain bt_rx_char buffer here before or instead.
     int c = getchar_timeout_us(0);
+    // --- Bluetooth serial (non-blocking, Pico 2 W only) ---
+    // bt_serial_getchar() drains the RX ring buffer populated by the BTstack
+    // RFCOMM_DATA_PACKET callback.  Both sources use the same character dispatch
+    // below, so BT commands are identical to USB commands.
+#if defined(PICO_BT_SERIAL_ENABLED)
+    if (c == PICO_ERROR_TIMEOUT) c = bt_serial_getchar();
+#endif
     switch (c) {
         case ' ':               return CMD_CYCLE;
         case 'r':               return CMD_RED;
@@ -803,8 +823,10 @@ PatternCommand input_get_event(void)
 int main(void) {
     stdio_init_all();
 
+#ifdef PICO_DEFAULT_LED_PIN
     gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN,true);    
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, true);
+#endif
     blink(1);
 
     // The "cycle" button flips to the next pattern when pressed
@@ -837,7 +859,7 @@ int main(void) {
 
     set_sys_clock_khz(sysClkKHz, true);
     // init uart now that clk_frequency has changed
-    
+
     stdio_init_all();
     //while (!stdio_usb_connected()) { sleep_ms(10); }  // wait for terminal
 
@@ -882,6 +904,21 @@ int main(void) {
 
     // wait for initialization of video to be complete
     sem_acquire_blocking(&video_initted);
+
+    // Pico 2 W: init CYW43 and BTstack SPP *after* Core 1 has started and
+    // registered itself as a flash_safe_execute lockout victim (see render_graphics).
+    // cyw43_arch_init() triggers a BTstack TLV flash erase on first boot, which
+    // calls flash_safe_execute internally.  That requires Core 1 to be running and
+    // lockout-ready; calling it before Core 1 starts caused an assert in flash.c.
+    // System clock is already at its final value (set above), so CYW43 SPI
+    // dividers will be configured correctly.
+#if defined(PICO_BT_SERIAL_ENABLED)
+    if (cyw43_arch_init() != 0) {
+        printf("CYW43 init failed — running USB serial only\r\n");
+    } else {
+        bt_serial_init();
+    }
+#endif
 
     print_help();
 
@@ -1280,7 +1317,9 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
         scanline_buffer->data_used = ((uint32_t *)p) - scanline_buffer->data;
         if(scanline_buffer->data_used > scanline_buffer->data_max)
         {
-            gpio_put(PICO_DEFAULT_LED_PIN,false);
+#ifdef PICO_DEFAULT_LED_PIN
+            gpio_put(PICO_DEFAULT_LED_PIN, false);
+#endif
         }
 
         scanline_buffer->status = SCANLINE_OK;
@@ -1396,12 +1435,20 @@ void __time_critical_func(render_graphics)() {
     scanvideo_timing_enable(true);
     sem_release(&video_initted);
 
+    // Register Core 1 permanently as a flash_safe_execute lockout victim.
+    // This lets Core 0 call flash_safe_execute at any time — both for settings
+    // writes (update_flash_settings) and for BTstack TLV operations — without
+    // needing explicit per-call init/deinit coordination.
+    // Must be called after sem_release so Core 0's cyw43_arch_init (which comes
+    // after sem_acquire_blocking) finds Core 1 already registered.
+    flash_safe_execute_core_init();
+
     while (true) {
-        // Pause rendering while Core 0 performs a flash write.
+        // Spin if Core 0 has signalled a flash write.  The actual Core 1 lockout
+        // is handled automatically by the interrupt registered above; this spin
+        // loop is retained as belt-and-suspenders coordination.
         if (wait_for_flash) {
-            flash_safe_execute_core_init();
             while (wait_for_flash) { /* spin */ }
-            flash_safe_execute_core_deinit();
         }
 
         scanvideo_scanline_buffer_t *buf = scanvideo_begin_scanline_generation(true);

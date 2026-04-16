@@ -13,13 +13,30 @@ CMake project. Requires:
 - `PICO_SDK_PATH` environment variable pointing to the Pico SDK
 - `pico-extras` checked out alongside this repo (provides `pico_scanvideo_dpi`)
 
-Target platform/board flags (in `.vscode/settings.json` or passed to CMake):
+Two build variants are defined in `CMakePresets.json` at the repo root:
+
+| Preset | Board | Output dir | Bluetooth |
+|--------|-------|-----------|-----------|
+| `pico2` | pico2 (RP2350) | `build-pico2/` | No |
+| `pico2_w` | pico2_w (RP2350 + CYW43) | `build-pico2w/` | Yes (Classic SPP) |
+
+**VS Code**: select the preset via the CMake Tools status bar (bottom bar → kit/variant picker shows "Pico 2" and "Pico 2 W (Bluetooth)").
+
+**Command line**:
+```bash
+# Pico 2 (no Bluetooth)
+cmake --preset pico2 && cmake --build --preset pico2
+
+# Pico 2 W (Bluetooth Classic SPP)
+cmake --preset pico2_w && cmake --build --preset pico2_w
+```
+
+The `.vscode/settings.json` only needs to set the SDK path — board selection comes from the preset:
 ```json
 {
-    "cmake.configureArgs": [
-        "-DPICO_PLATFORM=rp2350",
-        "-DPICO_BOARD=pico2"
-    ]
+    "cmake.environment": {
+        "PICO_SDK_PATH": "../../../pico-sdk"
+    }
 }
 ```
 
@@ -28,6 +45,7 @@ Build output is a `copy_to_ram` binary (program loaded into RAM at startup).
 Key compile defines in `test_pattern/CMakeLists.txt`:
 - `PICO_SCANVIDEO_ENABLE_CLOCK_PIN=1` — outputs pixel clock on GPIO
 - `PICO_SCANVIDEO_ENABLE_DEN_PIN=1` — outputs data enable signal
+- `PICO_BT_SERIAL_ENABLED=1` — injected for pico2_w builds; guards all BT C code (note: `PICO_CYW43_SUPPORTED` is a CMake-only variable and is NOT available as a C preprocessor define)
 
 ---
 
@@ -39,17 +57,21 @@ Key compile defines in `test_pattern/CMakeLists.txt`:
 | `test_pattern/CMakeLists.txt` | Build config |
 | `test_pattern/text.h` | 188×98px bitmap array (BGRA5515 format) for the text pattern |
 | `test_pattern/userio.h` | Serial input helpers: `mygetchar()`, `getString()`, `getFloat()`, `getInt()` |
+| `test_pattern/bt_serial.h` | Bluetooth Classic SPP backend (pico2_w only) — ring buffers, BTstack packet handler, stdio driver |
+| `test_pattern/btstack_config.h` | Required BTstack configuration header (buffer sizes, feature flags) |
 | `test_pattern/vcocalc.py` | PLL calculator: given target MHz → REFDIV/FBDIV/PD1/PD2 params |
+| `CMakePresets.json` | CMake configure/build presets for pico2 and pico2_w variants |
 | `pinout.png` | GPIO pinout diagram for the LCD interface |
 
 ---
 
 ## Hardware
 
-- **MCU**: Raspberry Pi Pico 2 (RP2350)
+- **MCU**: Raspberry Pi Pico 2 (RP2350) or Pico 2 W (RP2350 + CYW43439 wireless chip)
 - **Interface**: Parallel TTL LCD (driven via PIO scanvideo)
 - **GPIO 28**: Cycle button — advances to next pattern on press
-- **USB**: Serial terminal for interactive control and debug output
+- **USB**: Serial terminal for interactive control and debug output (both variants)
+- **Bluetooth Classic SPP**: Second serial interface on Pico 2 W; device name `PicoLCD`
 
 ---
 
@@ -113,14 +135,60 @@ Flash writes use `flash_safe_execute()` to safely pause Core 1 rendering.
 
 ## Dual-Core Architecture
 
-- **Core 0**: Serial/USB input processing, button polling, UI menus, flash operations
+- **Core 0**: Serial/USB input processing, button polling, UI menus, flash operations, BT serial (pico2_w)
 - **Core 1**: `render_graphics()` — infinite scanline rendering loop
 
 Synchronization:
 - `sem_t video_initted` — Core 1 signals Core 0 when scanvideo is initialized
 - `volatile bool wait_for_flash` — Core 0 sets this to pause Core 1 during flash writes
 
+Flash safety: Core 1 calls `flash_safe_execute_core_init()` once at startup (after `sem_release(&video_initted)`) to permanently register as a `flash_safe_execute` lockout victim. This allows Core 0 to safely pause Core 1 during flash writes without deadlock. Do **not** call `flash_safe_execute_core_deinit()` — un-registering Core 1 would break subsequent flash writes.
+
 Time-critical note: `draw_bitmap()` is decorated with `__time_critical_func` to ensure it runs from RAM and avoids flash access latency during scanline generation.
+
+---
+
+## Bluetooth Serial Interface (Pico 2 W only)
+
+Enabled when `PICO_BT_SERIAL_ENABLED=1` is defined (injected by CMake for pico2_w builds).
+
+### Architecture
+
+- **Protocol**: Bluetooth Classic SPP (Serial Port Profile) over RFCOMM — appears as a standard virtual COM port
+- **Pairing**: Just Works (no PIN, no confirmation) via `SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT`
+- **Device name**: `PicoLCD`
+- **Async context**: `pico_cyw43_arch_none` (threadsafe_background, no lwIP) + `pico_btstack_cyw43` integration layer
+- **Stdio integration**: BT is registered as a `stdio_driver_t` alongside USB CDC — all `printf()` output goes to both; `mygetchar()` and `input_get_event()` poll both
+
+### Init ordering (critical)
+
+```
+Core 1 started → sem_release(&video_initted)
+               → flash_safe_execute_core_init()   ← MUST be before cyw43_arch_init()
+               → scanline loop
+
+Core 0: sem_acquire_blocking(&video_initted)       ← wait for Core 1
+      → cyw43_arch_init()                          ← at final system clock; Core 1 registered
+      → bt_serial_init()                           ← BTstack SPP setup
+      → event loop
+```
+
+`cyw43_arch_init()` triggers BTstack TLV flash erasure on first boot, which internally calls `flash_safe_execute()`. Core 1 must already be registered as a lockout victim at that point, or the assertion fails.
+
+### Key C guards
+
+All BT-specific C code uses `#if defined(PICO_BT_SERIAL_ENABLED)` — never `PICO_CYW43_SUPPORTED` (that is a CMake variable only, not a C define).
+
+### CMake library dependencies (pico2_w only)
+
+```cmake
+pico_cyw43_arch_none       # CYW43 driver without lwIP; threadsafe_background async context
+pico_btstack_cyw43         # CYW43/BTstack integration layer (HCI transport, async wiring)
+pico_btstack_classic       # Classic BT: L2CAP, RFCOMM, SDP, SPP
+pico_btstack_base          # BTstack core
+```
+
+Do **not** use `pico_cyw43_arch_threadsafe_background` — it unconditionally pulls in lwIP (`cyw43_lwip.c` → `lwip/netif.h`) and causes link errors when lwIP is not installed.
 
 ---
 
@@ -288,9 +356,15 @@ When `PICO_SCANVIDEO_ENABLE_CLOCK_PIN=1` (as used here), the system clock must b
 ```c
 void render_graphics() {
     // scanvideo_setup() and scanvideo_timing_enable() called here
-    sem_release(&video_initted);  // signal Core 0
+    sem_release(&video_initted);          // signal Core 0 that video is ready
+    flash_safe_execute_core_init();       // register as flash_safe_execute lockout victim
+                                          // (required for flash writes and cyw43_arch_init on Core 0)
 
     while (true) {
+        if (wait_for_flash) {
+            while (wait_for_flash) { }    // spin while Core 0 writes flash
+        }
+
         scanvideo_scanline_buffer_t *buf = scanvideo_begin_scanline_generation(true);
         uint16_t line = scanvideo_scanline_number(buf->scanline_id);
 
