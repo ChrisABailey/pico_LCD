@@ -1,4 +1,16 @@
+# IDE / editor
 .idea
 .vscode
+.cache
+
+# AI assistant session data
+.claude
+
+# CMake build directories (covers both legacy 'build' and preset dirs build-pico2/, build-pico2w/, etc.)
 cmake-*
 build
+build-*/
+
+# Generated flash bitmap images (output of make_flash_bitmap.py)
+#*.bin
+
