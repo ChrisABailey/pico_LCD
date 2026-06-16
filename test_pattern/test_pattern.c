@@ -757,6 +757,19 @@ void blink(int count)
         busy_wait_ms(200);
     }
 }
+
+#if defined(PICO_BT_SERIAL_ENABLED)
+// Blink the CYW43 LED from Core 0 only (after cyw43_arch_init).
+static void blink_led_core0(int count)
+{
+    for (int i = 0; i < count; i++) {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+        busy_wait_ms(200);
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        busy_wait_ms(200);
+    }
+}
+#endif
 /********************************************************
 //
 // Input abstraction layer (Core 0)
@@ -780,6 +793,13 @@ PatternCommand input_get_event(void)
         last_button_state = btn;
         if (!btn)                           // falling edge = pressed
             return CMD_CYCLE;
+        else {
+#if defined(PICO_BT_SERIAL_ENABLED)
+                blink_led_core0(1);
+#else
+                blink(1);
+#endif
+            }
     }
 
     // --- USB serial (non-blocking) ---
@@ -925,7 +945,11 @@ int main(void) {
     print_help();
 
     busy_wait_ms(500);
+#if defined(PICO_BT_SERIAL_ENABLED)
+    blink_led_core0(4);
+#else
     blink(4);
+#endif
     while (true) {
         // Sync to vblank to prevent a mid-frame pattern switch causing a
         // visible tear line.  (A small tear still occurs due to scanline
