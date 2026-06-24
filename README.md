@@ -97,6 +97,7 @@ test_pattern.c
 - Animation (bouncing rectangle)
 - LCD border (single pixel white boarder with inner single red pixel on black screen)
 - Bitmap (sample text)
+- Font text (an arbitrary ASCII string rendered from a built-in 8×8 font)
 
 Patterns are selectable using a serial terminal connected to the pico USB
 
@@ -117,6 +118,36 @@ For a fuller description of scanout video see [here](https://github.com/raspberr
 For displaying a bitmap encode the bitmap into a C byte array using the python [packtiles program](flash_stream/img/packtiles)
 
 Specifically call: `./packtiles -sf bgar5515 text_box.png textbox.h ` to encode a png into a bytearray in a c header "textbox.h".  Also update the macros for height and width
+
+## Font Text Pattern
+
+Press **`f`** in the serial terminal to display a text string rendered with a
+built-in 8×8 bitmap font (`test_pattern/font8x8.h`).  Unlike the `t` pattern —
+which blits the fixed full-colour bitmap from `text.h` — this draws arbitrary
+characters scaled by an integer factor, so the same font works at any size.
+
+Supported characters: space, `A`–`Z` (lower-case is upper-cased), `0`–`9`, and
+the punctuation `. , : - + / * ( )`.  Unsupported characters render as a blank.
+
+The string, position, scale and colours are compiled-in defaults set near the
+top of `test_pattern.c`:
+
+```c
+const char *string_text_msg = "HELLO PICO 0123";
+int  STR_X = 8;       // top-left X
+int  STR_Y = 8;       // top-left Y
+uint STR_SCALE = 3;   // 1 = 8×8, 2 = 16×16, 3 = 24×24 ...
+```
+
+Edit those and rebuild to change the message.  `draw_text()` is reusable on its
+own:
+
+```c
+draw_text(buf, "TEXT", x, y, background_color, foreground_color, scale);
+```
+
+Very long strings or large scales that would exceed the per-scanline buffer fall
+back to a solid background line rather than corrupting the display.
 
 ## Custom Bitmap Pattern
 
@@ -155,7 +186,12 @@ picotool reboot
 ### Flashing with uf2conv (drag-and-drop)
 
 ```bash
-uf2conv -f rp2350 -b 0x10100000 my_image.bin -o my_image.uf2
+uf2conv -f rp2040 -b 0x10100000 my_image.bin -o my_image.uf2
+```
+
+to instal u2fconv:
+```bash
+python3 -m pip install --pre -U git+https://github.com/makerdiary/uf2utils.git@main
 ```
 
 Copy `my_image.uf2` to the `RPI-RP2` drive that appears when the Pico is in

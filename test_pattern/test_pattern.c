@@ -19,6 +19,7 @@
 #include "hardware/flash.h"
 #include "hardware/watchdog.h"
 #include "text.h"
+#include "font8x8.h"
 // bt_serial.h must be included before userio.h: userio.h's mygetchar() calls
 // bt_serial_getchar(), so the declaration must be visible first.
 #if defined(PICO_BT_SERIAL_ENABLED)
@@ -78,7 +79,7 @@ static          uint16_t bitmap_cached_height = 0;
 
 //#define video_mode vga_mode_640x480_60_clk
 
-typedef enum { black, blue, cyan, green, yellow, red, magenta, white, custom, bars, border, text, animate, grey, lines, box, custom_bitmap, max_pattern} Pattern;
+typedef enum { black, blue, cyan, green, yellow, red, magenta, white, custom, bars, border, text, animate, grey, lines, box, custom_bitmap, string_text, max_pattern} Pattern;
 
 // Commands produced by input_get_event() — one value per user action.
 // Adding a new input source (e.g. Bluetooth serial) only requires changes
@@ -103,6 +104,7 @@ typedef enum {
     CMD_LINES,
     CMD_BOX,
     CMD_CUSTOM_BITMAP,   // show user bitmap stored in flash
+    CMD_STRING_TEXT,     // show a string rendered with the 8x8 font
     CMD_PROGRAM_TIMING,  // interactive timing-programming menu
     CMD_PRINT_TIMING,    // print current clock settings (no pattern change)
     CMD_HELP,            // unrecognised key → print help
@@ -111,6 +113,13 @@ typedef enum {
 // Named positions for the bitmap text pattern
 int TEXT_X = 0;
 int TEXT_Y = 1;
+
+// Default string drawn by the 8x8-font string_text pattern, plus its position,
+// scale and colours.  Hardcoded for now (no interactive entry).
+const char *string_text_msg = "HELLO PICO 0123";
+int  STR_X = 8;
+int  STR_Y = 8;
+uint STR_SCALE = 3;
 
 //PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN ??
 //PICO_SCANVIDEO_ENABLE_DEN_PIN
@@ -263,6 +272,7 @@ const char* pattern_to_string(Pattern pattern){
         case lines: return "lines";
         case box: return "box";
         case custom_bitmap: return "custom bitmap";
+        case string_text: return "string text";
         default: return "unknown";
     }
 }
@@ -724,6 +734,7 @@ void print_help()
     printf("  l: 5x5 grid of white (L)ines\r\n");
     printf("  x: white bo(X) on black screen\r\n");
     printf("  i: custom b(I)tmap from flash\r\n");
+    printf("  f: (F)ont text string \"%s\"\r\n", string_text_msg);
     printf("  p: (P)rogram new video timings\r\n");
     printf("  z: print video clock timing\r\n");
 }
@@ -830,6 +841,7 @@ PatternCommand input_get_event(void)
         case 'l':               return CMD_LINES;
         case 'x':               return CMD_BOX;
         case 'i':               return CMD_CUSTOM_BITMAP;
+        case 'f':               return CMD_STRING_TEXT;
         case 'p':               return CMD_PROGRAM_TIMING;
         case 'z':               return CMD_PRINT_TIMING;
         case PICO_ERROR_TIMEOUT: return CMD_NONE;
@@ -984,6 +996,7 @@ int main(void) {
             case CMD_LINES:   pattern = lines;   break;
             case CMD_BOX:           pattern = box;           break;
             case CMD_CUSTOM_BITMAP: pattern = custom_bitmap; break;
+            case CMD_STRING_TEXT:   pattern = string_text;   break;
             case CMD_NEW_COLOR:
                 pattern = custom;
                 get_custom_color(&custom_red, &custom_green, &custom_blue);
@@ -1049,25 +1062,48 @@ void draw_color_line(scanvideo_scanline_buffer_t *buffer, uint32_t color) {
 
 }
 
+// Emit `n` pixels of a single colour using the smallest composable token form.
+// Handles n==0 (nothing), 1 (RAW_1P), 2 (RAW_2P) and >=3 (COLOR_RUN), so callers
+// never produce a sub-3-pixel COLOR_RUN whose (n-3) count field would underflow.
+static inline void emit_run(uint16_t **pp, uint32_t color, uint n) {
+    uint16_t *p = *pp;
+    if (n == 1) {
+        *p++ = COMPOSABLE_RAW_1P;
+        *p++ = (uint16_t)color;
+    } else if (n == 2) {
+        *p++ = COMPOSABLE_RAW_2P;
+        *p++ = (uint16_t)color;
+        *p++ = (uint16_t)color;
+    } else if (n >= 3) {
+        *p++ = COMPOSABLE_COLOR_RUN;
+        *p++ = (uint16_t)color;
+        *p++ = (uint16_t)(n - 3);
+    }
+    *pp = p;
+}
+
 // draw 8 color bars from left to right
 void draw_color_bars(scanvideo_scanline_buffer_t *buffer) {
     uint16_t bar_width = (video_mode.width-1) / 8;
-    uint32_t color;
+
+    // Each bar must be at least 3 px for a COLOR_RUN; too narrow a display can't
+    // show 8 distinct bars, so fall back to a black line instead of underflowing.
+    if (bar_width < 3) {
+        draw_color_line(buffer, pattern_to_color(black));
+        return;
+    }
 
     uint16_t *p = (uint16_t *) buffer->data;
 
     for (uint bar = 8; bar > 0; bar--) {
         *p++ = COMPOSABLE_COLOR_RUN;
-        color = pattern_to_color((Pattern)(bar - 1));
-        *p++ = color;
+        *p++ = pattern_to_color((Pattern)(bar - 1));
         *p++ = bar_width - 3;
     }
-    if (8 * bar_width < video_mode.width) {
-        // fill any remaining pixels (due to rounding)
-        *p++ = COMPOSABLE_COLOR_RUN;
-        *p++ = pattern_to_color(black);
-        *p++ = video_mode.width - 3 - 8 * bar_width;
-    }
+    // Fill any remaining pixels from integer rounding.  emit_run copes with a
+    // 1- or 2-px remainder (which a bare COLOR_RUN count would underflow on).
+    emit_run(&p, pattern_to_color(black), (uint)video_mode.width - 8u * bar_width);
+
     //black pixel to end line
     *p++ = COMPOSABLE_RAW_1P;
     *p++ = 0;
@@ -1097,6 +1133,13 @@ void draw_color_shades(scanvideo_scanline_buffer_t *buffer) {
     uint32_t color_mask = PICO_SCANVIDEO_PIXEL_FROM_RGB5(0x1f * (primary_color & 1u), 0x1f * ((primary_color >> 1u) & 1u), 0x1f * ((primary_color >> 2u) & 1u));
     uint bar_width = video_mode.width / 32;
 
+    // Each bar needs >=3 px for a COLOR_RUN; a display narrower than 96 px can't
+    // show 32 distinct bars, so fall back to a black line instead of underflowing.
+    if (bar_width < 3) {
+        draw_color_line(buffer, pattern_to_color(black));
+        return;
+    }
+
     uint16_t *p = (uint16_t *) buffer->data;
 
     for (uint bar = 0; bar < 32; bar++) {
@@ -1106,15 +1149,21 @@ void draw_color_shades(scanvideo_scanline_buffer_t *buffer) {
         *p++ = bar_width - 3;
     }
 
-    // 32 * 3, so we should be word aligned
-    assert(!(3u & (uintptr_t) p));
+    // Pad the rounding remainder (width not a multiple of 32) so the scanline is
+    // exactly video_mode.width pixels — a short line desyncs the timing PIO.
+    emit_run(&p, pattern_to_color(black), (uint)video_mode.width - 32u * bar_width);
 
     // black pixel to end line
     *p++ = COMPOSABLE_RAW_1P;
     *p++ = 0;
-    // end of line with alignment padding
-    *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
-    *p++ = 0;
+    // end of line with alignment padding (parity now varies with the remainder fill)
+    if (((uintptr_t)p) & 3) {
+        *p++ = COMPOSABLE_EOL_ALIGN;
+        *p++ = 0;
+    } else {
+        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+        *p++ = 0;
+    }
 
     buffer->data_used = ((uint32_t *) p) - buffer->data;
     assert(buffer->data_used < buffer->data_max);
@@ -1380,6 +1429,101 @@ void __time_critical_func(draw_bitmap)(scanvideo_scanline_buffer_t *scanline_buf
     }
 }
 
+// Render one scanline of an ASCII string using the 8x8 font (font8x8.h).
+// Each glyph is scaled by an integer factor (scale=1 -> 8x8, scale=2 -> 16x16...).
+// Pixels where the glyph bit is set use `fg`; everywhere else (inter-glyph gaps,
+// margins and the rest of the line) uses `bg`.  The text region is emitted as a
+// single COMPOSABLE_RAW_RUN.  The text is clipped to the display width so the
+// emitted scanline is always exactly video_mode.width pixels — emitting an
+// over-long line desyncs the timing PIO and blanks the panel.  Off-band scanlines
+// and any case with too little room fall back to a solid `bg` line.
+void __time_critical_func(draw_text)(scanvideo_scanline_buffer_t *scanline_buffer,
+        const char *text, int x, int y, uint32_t bg, uint32_t fg, uint scale)
+{
+    uint line_num = scanvideo_scanline_number(scanline_buffer->scanline_id);
+    uint band_h = (uint)FONT8X8_H * scale;
+    uint len = (uint)strlen(text);
+    uint text_px = len * (uint)FONT8X8_W * scale;
+    uint width = video_mode.width;
+
+    // Off-band, empty/degenerate, or start position off the right edge: solid bg.
+    if (scale == 0 || text_px < 3 || x < 0 || (uint)x >= width ||
+        line_num < (uint)y || line_num >= (uint)y + band_h) {
+        draw_color_line(scanline_buffer, bg);
+        return;
+    }
+
+    // Clip the visible text width so [x .. x+vis) plus a mandatory trailing black
+    // pixel all fit inside the display.  vis<3 has no room for a RAW_RUN -> bg line.
+    uint avail = width - (uint)x;            // pixels from x to the right edge
+    uint vis = text_px;
+    if (vis > avail - 1) vis = avail - 1;    // leave >=1 px for the trailing black
+    if (vis < 3) {
+        draw_color_line(scanline_buffer, bg);
+        return;
+    }
+
+    // Worst-case token guard: left-pad (3) + RAW_RUN header (3) + (vis-1) pixels +
+    // right-fill (3) + trailing RAW_1P (2) + EOL (2).
+    uint estimated_words = (13u + vis + 1u) / 2u;
+    if (estimated_words > scanline_buffer->data_max) {
+        draw_color_line(scanline_buffer, bg);
+        return;
+    }
+
+    uint glyph_row = (line_num - (uint)y) / scale;   // 0..7
+
+    uint16_t *p = (uint16_t *)scanline_buffer->data;
+
+    // Left background margin (x pixels), smallest-token form.
+    emit_run(&p, bg, (uint)x);
+
+    // Text region as one RAW_RUN: reserve the pixel-0 slot and count field, then
+    // stream pixels 1..vis-1.  count = vis-3 -> vis pixels total (see draw_bitmap).
+    *p++ = COMPOSABLE_RAW_RUN;
+    uint16_t *pixel0 = p++;
+    *p++ = (uint16_t)(vis - 3);
+    // Division-free nested walk (char -> column -> scale).  This runs once per
+    // active pixel inside the time-critical scanline budget, so it must stay
+    // cheap: look the glyph row byte up ONCE per character (not per pixel), and
+    // avoid per-pixel divides/modulo/function calls — those overran the ~66 us
+    // DCDU line time and caused PIO underruns.  `pidx` only gates the clip.
+    uint pidx = 0;
+    for (uint ci = 0; ci < len && pidx < vis; ci++) {
+        uint8_t rowbits = font_glyph(text[ci])[glyph_row];
+        for (uint col = 0; col < (uint)FONT8X8_W && pidx < vis; col++) {
+            uint16_t color = (rowbits & (1u << col)) ? (uint16_t)fg : (uint16_t)bg;
+            for (uint s = 0; s < scale && pidx < vis; s++) {
+                if (pidx == 0)
+                    *pixel0 = color;
+                else
+                    *p++ = color;
+                pidx++;
+            }
+        }
+    }
+
+    // Right background margin.  Total so far = x + vis; leave 1 px for trailing black.
+    emit_run(&p, bg, width - (uint)x - vis - 1u);
+
+    // black pixel to end line
+    *p++ = COMPOSABLE_RAW_1P;
+    *p++ = 0;
+
+    // end of line with alignment padding (see feedback_eol_alignment)
+    if (((uintptr_t)p) & 3) {
+        *p++ = COMPOSABLE_EOL_ALIGN;
+        *p++ = 0;
+    } else {
+        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+        *p++ = 0;
+    }
+
+    scanline_buffer->data_used = ((uint32_t *)p) - scanline_buffer->data;
+    assert(scanline_buffer->data_used < scanline_buffer->data_max);
+    scanline_buffer->status = SCANLINE_OK;
+}
+
 
 
 /*************************************************************************
@@ -1398,6 +1542,13 @@ static void draw_solid_color(scanvideo_scanline_buffer_t *buf) {
 // Text bitmap at the named position macros.
 static void draw_text_pattern(scanvideo_scanline_buffer_t *buf) {
     draw_bitmap(buf, (const uint16_t *)textbox, text_width, text_height, TEXT_X, TEXT_Y);
+}
+
+// String rendered with the 8x8 font: white on black at the configured
+// position/scale.
+static void draw_text_string(scanvideo_scanline_buffer_t *buf) {
+    draw_text(buf, string_text_msg, STR_X, STR_Y,
+              pattern_to_color(black), pattern_to_color(white), STR_SCALE);
 }
 
 // Centred white box — one-third of the display in each dimension.
@@ -1482,6 +1633,7 @@ static const draw_fn_t pattern_handlers[max_pattern] = {
     [lines]         = draw_grid,
     [box]           = draw_box_pattern,
     [custom_bitmap] = draw_flash_bitmap,
+    [string_text]   = draw_text_string,
 };
 
 // Core 1 entry point: initialises scanvideo then renders one scanline per

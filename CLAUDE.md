@@ -56,6 +56,7 @@ Key compile defines in `test_pattern/CMakeLists.txt`:
 | `test_pattern/test_pattern.c` | Main application — all pattern logic, serial UI, flash persistence |
 | `test_pattern/CMakeLists.txt` | Build config |
 | `test_pattern/text.h` | 188×98px bitmap array (BGRA5515 format) for the text pattern |
+| `test_pattern/font8x8.h` | 8×8 monochrome bitmap font (space, A–Z, 0–9, `.,:-+/*()`) + `font_glyph()` mapper, used by `draw_text()` |
 | `test_pattern/userio.h` | Serial input helpers: `mygetchar()`, `getString()`, `getFloat()`, `getInt()` |
 | `test_pattern/bt_serial.h` | Bluetooth Classic SPP backend (pico2_w only) — ring buffers, BTstack packet handler, stdio driver |
 | `test_pattern/btstack_config.h` | Required BTstack configuration header (buffer sizes, feature flags) |
@@ -90,7 +91,7 @@ Timing is persisted to flash. On boot, saved timing is restored; if none saved, 
 
 ## Test Patterns
 
-16 patterns defined in the `Pattern` enum:
+Patterns defined in the `Pattern` enum:
 
 | Key | Pattern | Description |
 |-----|---------|-------------|
@@ -108,6 +109,7 @@ Timing is persisted to flash. On boot, saved timing is restored; if none saved, 
 | `s` | bars | 8 horizontal color bars |
 | `e` | border | White outer + red inner single-pixel border on black |
 | `t` | text | Bitmap text (from `text.h`) rendered at position (15, 15) |
+| `f` | string_text | ASCII string drawn with the 8×8 font (`font8x8.h`) via `draw_text()`; default `string_text_msg` at (`STR_X`,`STR_Y`), scaled by `STR_SCALE` |
 | `a` | animate | Bouncing colored rectangle |
 | `3` / `q` | grey | 32 greyscale shade bars |
 | `l` | lines | 5×5 grid of white lines |
