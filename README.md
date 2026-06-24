@@ -97,7 +97,7 @@ test_pattern.c
 - Animation (bouncing rectangle)
 - LCD border (single pixel white boarder with inner single red pixel on black screen)
 - Bitmap (sample text)
-- Font text (an arbitrary ASCII string rendered from a built-in 8×8 font)
+- Font text (4 editable lines rendered from a built-in 8×8 font)
 
 Patterns are selectable using a serial terminal connected to the pico USB
 
@@ -121,33 +121,57 @@ Specifically call: `./packtiles -sf bgar5515 text_box.png textbox.h ` to encode 
 
 ## Font Text Pattern
 
-Press **`f`** in the serial terminal to display a text string rendered with a
-built-in 8×8 bitmap font (`test_pattern/font8x8.h`).  Unlike the `t` pattern —
-which blits the fixed full-colour bitmap from `text.h` — this draws arbitrary
-characters scaled by an integer factor, so the same font works at any size.
+Press **`f`** in the serial terminal to display **four lines** of text rendered
+with a built-in 8×8 bitmap font (`test_pattern/font8x8.h`) at a fixed scale of 2
+(16×16 px glyphs).  Unlike the `t` pattern — which blits the fixed full-colour
+bitmap from `text.h` — this draws arbitrary characters.
 
 Supported characters: space, `A`–`Z` (lower-case is upper-cased), `0`–`9`, and
 the punctuation `. , : - + / * ( )`.  Unsupported characters render as a blank.
 
-The string, position, scale and colours are compiled-in defaults set near the
-top of `test_pattern.c`:
+### Editing the text
+
+Press **`F`** (shift-f) to edit the four lines interactively over the serial
+terminal (USB or Bluetooth).  Enter a new string for each line, or press Enter
+alone to keep the current one.  The pattern is shown immediately afterwards.
+
+### Changing the text from your own code (Core 0)
+
+Call `set_text_line()` from Core 0 at any time — e.g. to display live sensor
+readings:
 
 ```c
-const char *string_text_msg = "HELLO PICO 0123";
-int  STR_X = 8;       // top-left X
-int  STR_Y = 8;       // top-left Y
-uint STR_SCALE = 3;   // 1 = 8×8, 2 = 16×16, 3 = 24×24 ...
+set_text_line(0, "TEMP 21.4 C");   // line index 0..3
 ```
 
-Edit those and rebuild to change the message.  `draw_text()` is reusable on its
-own:
+It is lock-free and safe to call while Core 1 is rendering (a concurrent update
+may tear a single frame, which is purely cosmetic).  Line buffers are
+`TEXT_LINE_MAXLEN` bytes; longer strings are truncated.
+
+### Defaults and layout
+
+Compiled-in defaults are near the top of `test_pattern.c`:
+
+```c
+#define TEXT_LINES        4    // number of lines
+#define TEXT_SCALE        2u   // 16×16 px glyphs
+#define TEXT_LINE_PITCH   (FONT8X8_H*TEXT_SCALE + 4)  // 20 px line spacing
+int STR_X = 8;                 // left margin for all lines
+int STR_Y = 8;                 // top of the first line
+volatile uint16_t text_fg, text_bg;   // colours (set in main(), changeable from Core 0)
+char text_lines[TEXT_LINES][TEXT_LINE_MAXLEN] = { ... };
+```
+
+The per-scanline renderer `draw_text()` is reusable on its own:
 
 ```c
 draw_text(buf, "TEXT", x, y, background_color, foreground_color, scale);
 ```
 
-Very long strings or large scales that would exceed the per-scanline buffer fall
-back to a solid background line rather than corrupting the display.
+Text is clipped to the display width, so strings wider than the screen are
+truncated cleanly rather than corrupting the line.  See
+[`scanline_sim/`](test_pattern/scanline_sim/) for a host-side tool that validates
+and previews the token stream this produces without flashing the board.
 
 ## Custom Bitmap Pattern
 

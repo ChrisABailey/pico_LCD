@@ -57,6 +57,7 @@ Key compile defines in `test_pattern/CMakeLists.txt`:
 | `test_pattern/CMakeLists.txt` | Build config |
 | `test_pattern/text.h` | 188×98px bitmap array (BGRA5515 format) for the text pattern |
 | `test_pattern/font8x8.h` | 8×8 monochrome bitmap font (space, A–Z, 0–9, `.,:-+/*()`) + `font_glyph()` mapper, used by `draw_text()` |
+| `test_pattern/scanline_sim/` | Host-side simulator (no SDK): a faithful PIO interpreter + `draw_text` token generator that validates and previews scanline token streams offline. Reuses the real `font8x8.h` |
 | `test_pattern/userio.h` | Serial input helpers: `mygetchar()`, `getString()`, `getFloat()`, `getInt()` |
 | `test_pattern/bt_serial.h` | Bluetooth Classic SPP backend (pico2_w only) — ring buffers, BTstack packet handler, stdio driver |
 | `test_pattern/btstack_config.h` | Required BTstack configuration header (buffer sizes, feature flags) |
@@ -109,7 +110,8 @@ Patterns defined in the `Pattern` enum:
 | `s` | bars | 8 horizontal color bars |
 | `e` | border | White outer + red inner single-pixel border on black |
 | `t` | text | Bitmap text (from `text.h`) rendered at position (15, 15) |
-| `f` | string_text | ASCII string drawn with the 8×8 font (`font8x8.h`) via `draw_text()`; default `string_text_msg` at (`STR_X`,`STR_Y`), scaled by `STR_SCALE` |
+| `f` | string_text | 4 lines of text drawn with the 8×8 font (`font8x8.h`) via `draw_text()`, fixed scale 2; lines held in `text_lines[4][]`, editable from Core 0 via `set_text_line()` |
+| `F` | — | Edit the 4 font-text lines interactively over serial (`edit_text_lines()`), then show them |
 | `a` | animate | Bouncing colored rectangle |
 | `3` / `q` | grey | 32 greyscale shade bars |
 | `l` | lines | 5×5 grid of white lines |
@@ -146,7 +148,11 @@ Synchronization:
 
 Flash safety: Core 1 calls `flash_safe_execute_core_init()` once at startup (after `sem_release(&video_initted)`) to permanently register as a `flash_safe_execute` lockout victim. This allows Core 0 to safely pause Core 1 during flash writes without deadlock. Do **not** call `flash_safe_execute_core_deinit()` — un-registering Core 1 would break subsequent flash writes.
 
-Time-critical note: `draw_bitmap()` is decorated with `__time_critical_func` to ensure it runs from RAM and avoids flash access latency during scanline generation.
+Time-critical note: `draw_bitmap()` and `draw_text()` are decorated with `__time_critical_func` to run from RAM and avoid flash latency during scanline generation.
+
+Scanline budget: a scanline handler must fill its buffer faster than the PIO drains it. The cycle budget per pixel is roughly the PIO clock divider (sysclk ÷ pixel clock) — typically ~16, but as low as **8** for the VGA/15 MHz modes (sysclk scales with the pixel clock, so this is what matters, not absolute MHz). Keep per-pixel work cheap: no divides, modulo, or function calls in the inner loop. `draw_text()` learned this the hard way — a per-pixel `/` + `%` + `font_glyph()` call overran the DCDU line time and caused PIO underruns (a stray colour bar). It now looks up each glyph byte once per character and walks columns with a division-free nested loop.
+
+Text pattern (`string_text`): renders `TEXT_LINES` (4) lines at fixed `TEXT_SCALE` (2). The handler `draw_text_string()` selects the one line a scanline falls in (one divide by the compile-time `TEXT_LINE_PITCH`) and calls `draw_text()` once, so per-scanline cost is independent of line count. `text_lines[4][TEXT_LINE_MAXLEN]` is written by Core 0 (`set_text_line()` / `edit_text_lines()`) and read by Core 1 — lock-free: buffers are fixed size and byte `MAXLEN-1` is never written, so Core 1's `strlen` can't overrun; a concurrent update only risks a one-frame cosmetic tear. `text_fg`/`text_bg` are changeable from Core 0 too.
 
 ---
 

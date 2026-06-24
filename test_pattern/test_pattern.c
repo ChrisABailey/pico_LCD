@@ -30,7 +30,7 @@
 #include "userio.h"
 
 #define CYCLE_BUTTON_PIN 28
-const char *RELEASE = "1.3.0";
+const char *RELEASE = "2.0.0";
 
 // Location in flash for the Timing settings.
 // For pico2 (no BT) the binary is ~130 KB so 256 KB is safe.
@@ -79,7 +79,7 @@ static          uint16_t bitmap_cached_height = 0;
 
 //#define video_mode vga_mode_640x480_60_clk
 
-typedef enum { black, blue, cyan, green, yellow, red, magenta, white, custom, bars, border, text, animate, grey, lines, box, custom_bitmap, string_text, max_pattern} Pattern;
+typedef enum {custom_bitmap, red, green, blue, white, black, magenta, yellow, cyan,  custom, grey, bars, border, string_text, lines, box,  text, animate, max_pattern} Pattern;
 
 // Commands produced by input_get_event() — one value per user action.
 // Adding a new input source (e.g. Bluetooth serial) only requires changes
@@ -104,7 +104,8 @@ typedef enum {
     CMD_LINES,
     CMD_BOX,
     CMD_CUSTOM_BITMAP,   // show user bitmap stored in flash
-    CMD_STRING_TEXT,     // show a string rendered with the 8x8 font
+    CMD_STRING_TEXT,     // show the 4-line 8x8-font text pattern
+    CMD_EDIT_TEXT,       // prompt to edit the 4 text lines, then show them
     CMD_PROGRAM_TIMING,  // interactive timing-programming menu
     CMD_PRINT_TIMING,    // print current clock settings (no pattern change)
     CMD_HELP,            // unrecognised key → print help
@@ -116,10 +117,24 @@ int TEXT_Y = 1;
 
 // Default string drawn by the 8x8-font string_text pattern, plus its position,
 // scale and colours.  Hardcoded for now (no interactive entry).
-const char *string_text_msg = "HELLO PICO 0123";
-int  STR_X = 8;
-int  STR_Y = 8;
-uint STR_SCALE = 3;
+// 8x8-font text pattern: always 4 lines, fixed scale 2 (16x16 glyphs).
+#define TEXT_LINES        4
+#define TEXT_SCALE        2u
+#define TEXT_LINE_MAXLEN  32   // bytes/line incl NUL; index MAXLEN-1 stays NUL (see set_text_line)
+#define TEXT_LINE_PITCH   ((uint)FONT8X8_H * TEXT_SCALE + 4u)  // 16px glyph + 4px gap = 20
+int STR_X = 8;                 // left margin for all lines
+int STR_Y = 8;                 // top of the first line
+// Foreground/background colours for the text.  Initialised in main() (the colour
+// macros aren't compile-time constants) and changeable from Core 0 at any time.
+volatile uint16_t text_fg = 0xFFFE;   // white  (overwritten in main)
+volatile uint16_t text_bg = 0x0000;   // black
+// The 4 text lines.  Core 0 writes these (set_text_line); Core 1 renders them.
+char text_lines[TEXT_LINES][TEXT_LINE_MAXLEN] = {
+    "PICO-LCD",
+    "REV 2.0.0",
+    "06/24/2026",
+    "DCDU MODE 480x234 @60Hz",
+};
 
 //PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN ??
 //PICO_SCANVIDEO_ENABLE_DEN_PIN
@@ -230,9 +245,9 @@ const scanvideo_mode_t ay_mode_768x256_60 =
 // the default can be changed using the "P"rogram command
 scanvideo_mode_t video_mode =dcdu_mode_480x234_60;
 scanvideo_timing_t video_timing = dcdu_timing_480x234_60_default;
-volatile uint8_t custom_red=239;
-volatile uint8_t custom_green=160;
-volatile uint8_t custom_blue=64;
+volatile uint8_t custom_red=255;
+volatile uint8_t custom_green=170;
+volatile uint8_t custom_blue=68;
 
 // forward refrence for render_graphics which is executed on core 1
 void render_graphics();
@@ -242,12 +257,12 @@ uint32_t pattern_to_color(Pattern pattern){
     switch(pattern){
         case black: return PICO_SCANVIDEO_PIXEL_FROM_RGB5(0, 0, 0);
         case blue: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0, 0xff);
-        case green: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0xff, 0);
-        case cyan: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0, 0xff, 0xef);
-        case red: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0, 0);
-        case magenta: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0, 0xdf);
-        case yellow: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xef, 0);
-        case white: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 0xff, 0xff);
+        case green: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(85, 0xff, 51);
+        case cyan: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(51, 0xff, 238);
+        case red: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 85, 85);
+        case magenta: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 102, 204);
+        case yellow: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 238, 51);
+        case white: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(0xff, 238, 221);
         case custom: return PICO_SCANVIDEO_PIXEL_FROM_RGB8(custom_red, custom_green,custom_blue);
         default: return 0x0000;
     }
@@ -734,7 +749,8 @@ void print_help()
     printf("  l: 5x5 grid of white (L)ines\r\n");
     printf("  x: white bo(X) on black screen\r\n");
     printf("  i: custom b(I)tmap from flash\r\n");
-    printf("  f: (F)ont text string \"%s\"\r\n", string_text_msg);
+    printf("  f: (F)ont text — %d lines, scale %u\r\n", TEXT_LINES, TEXT_SCALE);
+    printf("  F: edit the font text lines\r\n");
     printf("  p: (P)rogram new video timings\r\n");
     printf("  z: print video clock timing\r\n");
 }
@@ -749,6 +765,32 @@ void get_custom_color(volatile uint8_t*red,volatile uint8_t*green,volatile uint8
     printf("\r\nBlue[%d]:",*blue);
     *blue=getInt(true);
 
+}
+
+// Replace one line of the text pattern.  Safe to call from Core 0 while Core 1
+// renders: the buffers are fixed size and byte index MAXLEN-1 is never written
+// (strncpy copies at most MAXLEN-1 bytes), so it stays NUL and Core 1's strlen
+// can never run off the end.  A concurrent update may tear a single frame, which
+// is only cosmetic.  This is the entry point for changing the text from Core 0.
+void set_text_line(uint idx, const char *str)
+{
+    if (idx >= TEXT_LINES) return;
+    strncpy(text_lines[idx], str, TEXT_LINE_MAXLEN - 1);
+}
+
+// Interactive editor (Core 0): prompt for each of the 4 lines.  Blank entry keeps
+// the current line.  Demonstrates set_text_line().
+void edit_text_lines(void)
+{
+    char buf[TEXT_LINE_MAXLEN];
+    printf("\r\nEdit %d text lines (Enter alone keeps current, max %d chars):\r\n",
+           TEXT_LINES, TEXT_LINE_MAXLEN - 1);
+    for (uint i = 0; i < TEXT_LINES; i++) {
+        printf("Line %u [%s]: ", i + 1, text_lines[i]);
+        if (getString(buf, TEXT_LINE_MAXLEN, true) > 1)   // >1 = at least one char
+            set_text_line(i, buf);
+        printf("\r\n");
+    }
 }
 
 void blink(int count)
@@ -842,6 +884,7 @@ PatternCommand input_get_event(void)
         case 'x':               return CMD_BOX;
         case 'i':               return CMD_CUSTOM_BITMAP;
         case 'f':               return CMD_STRING_TEXT;
+        case 'F':               return CMD_EDIT_TEXT;
         case 'p':               return CMD_PROGRAM_TIMING;
         case 'z':               return CMD_PRINT_TIMING;
         case PICO_ERROR_TIMEOUT: return CMD_NONE;
@@ -856,6 +899,10 @@ PatternCommand input_get_event(void)
 ********************************************************/
 int main(void) {
     stdio_init_all();
+
+    // Default text colours (the colour macros aren't compile-time constants).
+    text_fg = pattern_to_color(white);
+    text_bg = pattern_to_color(black);
 
 #ifdef PICO_DEFAULT_LED_PIN
     gpio_init(PICO_DEFAULT_LED_PIN);
@@ -997,6 +1044,10 @@ int main(void) {
             case CMD_BOX:           pattern = box;           break;
             case CMD_CUSTOM_BITMAP: pattern = custom_bitmap; break;
             case CMD_STRING_TEXT:   pattern = string_text;   break;
+            case CMD_EDIT_TEXT:
+                edit_text_lines();
+                pattern = string_text;
+                break;
             case CMD_NEW_COLOR:
                 pattern = custom;
                 get_custom_color(&custom_red, &custom_green, &custom_blue);
@@ -1544,11 +1595,23 @@ static void draw_text_pattern(scanvideo_scanline_buffer_t *buf) {
     draw_bitmap(buf, (const uint16_t *)textbox, text_width, text_height, TEXT_X, TEXT_Y);
 }
 
-// String rendered with the 8x8 font: white on black at the configured
-// position/scale.
+// Four lines of 8x8-font text at fixed scale 2.  For each scanline we pick the
+// single line it falls in (one cheap divide by a compile-time constant) and call
+// draw_text once — so the per-scanline cost is one line's worth of pixels, no
+// matter how many lines are configured.  Inter-line gaps and rows past the last
+// line are handled by draw_text's own off-band fallback (a solid bg line).
 static void draw_text_string(scanvideo_scanline_buffer_t *buf) {
-    draw_text(buf, string_text_msg, STR_X, STR_Y,
-              pattern_to_color(black), pattern_to_color(white), STR_SCALE);
+    uint line_num = scanvideo_scanline_number(buf->scanline_id);
+    if (line_num >= (uint)STR_Y) {
+        uint which = (line_num - (uint)STR_Y) / TEXT_LINE_PITCH;
+        if (which < TEXT_LINES) {
+            int line_y = STR_Y + (int)(which * TEXT_LINE_PITCH);
+            draw_text(buf, text_lines[which], STR_X, line_y,
+                      text_bg, text_fg, TEXT_SCALE);
+            return;
+        }
+    }
+    draw_color_line(buf, text_bg);
 }
 
 // Centred white box — one-third of the display in each dimension.
