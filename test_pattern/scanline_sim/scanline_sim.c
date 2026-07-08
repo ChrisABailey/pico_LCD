@@ -148,6 +148,31 @@ static int gen_draw_text(int *s, uint width, const char *text,
     return (int)(p - s);
 }
 
+/* ---- gen_checkerboard: mirror of firmware draw_checkerboard() ---------------
+ * 5 cols x 3 rows black/white checkerboard, white in the centre cell.  Column
+ * boundaries use the same exact integer arithmetic as the firmware so the
+ * emitted columns sum to precisely `width` pixels.  Returns the token count. */
+#define CHECKER_COLS 5u
+#define CHECKER_ROWS 3u
+static int gen_checkerboard(int *s, uint width, uint height, int line_num) {
+    if (width < CHECKER_COLS * 3u)
+        return gen_color_line(s, width, COL_BG);
+
+    uint row = ((uint)line_num * CHECKER_ROWS) / height;
+
+    int *p = s;
+    uint prev = 0;
+    for (uint col = 0; col < CHECKER_COLS; col++) {
+        uint next = ((col + 1u) * width) / CHECKER_COLS;
+        int color = ((col + row) & 1u) ? COL_FG : COL_BG;
+        p = emit_run(p, color, next - prev);
+        prev = next;
+    }
+    *p++ = OP_RAW_1P; *p++ = 0;            /* trailing black */
+    p = emit_eol(p, s);
+    return (int)(p - s);
+}
+
 /* ---- pio_run: execute a token stream like the PIO ---------------------------
  * Writes the produced pixels into out[] (capped at maxout) and returns the pixel
  * count.  Sets *desync if the stream runs out mid-token or hits a value where an
@@ -237,6 +262,64 @@ static void sweep_widths(void) {
            total, sizeof(W) / sizeof(W[0]), fails, fails ? "PROBLEM" : "all OK");
 }
 
+/* Validate one checkerboard scanline: clean consume + covers the active region. */
+static int check_checker_line(uint width, uint height, int line) {
+    static int s[MAX_TOKENS];
+    static int out[MAX_TOKENS];
+    int n = gen_checkerboard(s, width, height, line);
+    bool desync;
+    int np = pio_run(s, n, out, MAX_TOKENS, &desync);
+    /* Same two-convention acceptance as check_line(): width or width+1 pixels. */
+    int ok = (!desync) && (np == (int)width || np == (int)width + 1);
+    if (!ok)
+        printf("  FAIL width=%u height=%u line=%d: pixels=%d (want %u or %u) desync=%d\n",
+               width, height, line, np, width, width + 1, desync);
+    return ok;
+}
+
+static void sweep_checkerboard(void) {
+    /* Real display widths (DCDU/PSP/AY/VGA) plus awkward sizes: not multiples of
+     * 5 (so column rounding kicks in) and below the 15px fallback threshold. */
+    const uint W[] = {480, 640, 768, 300, 234, 272, 240, 200, 123, 97, 64, 17, 15, 14, 8, 3};
+    const uint H[] = {234, 272, 256, 480, 100, 99, 7, 3, 1};
+    int fails = 0, total = 0;
+    printf("== checkerboard sweep (5x3, white centre) ==\n");
+    for (uint wi = 0; wi < sizeof(W)/sizeof(W[0]); wi++) {
+        for (uint hi = 0; hi < sizeof(H)/sizeof(H[0]); hi++) {
+            for (int line = 0; line < (int)H[hi]; line++) {
+                total++;
+                if (!check_checker_line(W[wi], H[hi], line)) fails++;
+            }
+        }
+    }
+    printf("  %d lines checked across %zu widths x %zu heights, %d failures -> %s\n\n",
+           total, sizeof(W)/sizeof(W[0]), sizeof(H)/sizeof(H[0]), fails,
+           fails ? "PROBLEM" : "all OK");
+}
+
+/* ASCII-art preview of the whole checkerboard for one (width,height). */
+static void preview_checker(uint width, uint height) {
+    static int s[MAX_TOKENS];
+    static int out[MAX_TOKENS];
+    printf("== checkerboard preview width=%u height=%u ==\n", width, height);
+    /* sample a manageable number of rows */
+    uint rows_shown = height < 24 ? height : 24;
+    for (uint r = 0; r < rows_shown; r++) {
+        int line = (int)((r * height) / rows_shown);
+        int n = gen_checkerboard(s, width, height, line);
+        bool desync;
+        int np = pio_run(s, n, out, MAX_TOKENS, &desync);
+        putchar('|');
+        uint cols_shown = width < 60 ? width : 60;
+        for (uint c = 0; c < cols_shown; c++) {
+            int i = (int)((c * width) / cols_shown);
+            putchar(i < np && out[i] != COL_BG ? '#' : ' ');
+        }
+        printf("|%s\n", desync ? "  <DESYNC>" : "");
+    }
+    putchar('\n');
+}
+
 /* Render the whole text pattern for one (width, scale) as ASCII art so glyphs can
  * be eyeballed without hardware.  '#' = foreground, ' ' = background. */
 static void preview(uint width, const char *text, int x, int y, uint scale) {
@@ -262,6 +345,10 @@ int main(int argc, char **argv) {
      * exercises clipping. */
     preview(480, "HELLO PICO 0123", 8, 8, 2);
     preview(200, "HELLO PICO 0123", 8, 8, 2);   /* clipped */
+
+    sweep_checkerboard();
+    preview_checker(480, 234);                   /* DCDU default */
+    preview_checker(123, 99);                    /* non-multiple-of-5 width */
     (void)argc; (void)argv;
     return 0;
 }

@@ -30,7 +30,7 @@
 #include "userio.h"
 
 #define CYCLE_BUTTON_PIN 28
-const char *RELEASE = "2.0.0";
+const char *RELEASE = "2.1.0";
 
 // Location in flash for the Timing settings.
 // For pico2 (no BT) the binary is ~130 KB so 256 KB is safe.
@@ -79,7 +79,7 @@ static          uint16_t bitmap_cached_height = 0;
 
 //#define video_mode vga_mode_640x480_60_clk
 
-typedef enum {custom_bitmap, red, green, blue, white, black, magenta, yellow, cyan,  custom, grey, bars, border, string_text, lines, box,  text, animate, max_pattern} Pattern;
+typedef enum {custom_bitmap, red, green, blue, white, black, magenta, yellow, cyan,  custom, grey, bars, border, string_text, lines, box, checkerboard,  text, animate, max_pattern} Pattern;
 
 // Commands produced by input_get_event() — one value per user action.
 // Adding a new input source (e.g. Bluetooth serial) only requires changes
@@ -103,6 +103,7 @@ typedef enum {
     CMD_NEW_COLOR,       // prompt for new custom colour then select it
     CMD_LINES,
     CMD_BOX,
+    CMD_CHECKERBOARD,    // 5x3 black/white checkerboard (white centre)
     CMD_CUSTOM_BITMAP,   // show user bitmap stored in flash
     CMD_STRING_TEXT,     // show the 4-line 8x8-font text pattern
     CMD_EDIT_TEXT,       // prompt to edit the 4 text lines, then show them
@@ -131,8 +132,8 @@ volatile uint16_t text_bg = 0x0000;   // black
 // The 4 text lines.  Core 0 writes these (set_text_line); Core 1 renders them.
 char text_lines[TEXT_LINES][TEXT_LINE_MAXLEN] = {
     "PICO-LCD",
-    "REV 2.0.0",
-    "06/24/2026",
+    "REV 2.1.0",
+    "07/08/2026",
     "DCDU MODE 480x234 @60Hz",
 };
 
@@ -286,6 +287,7 @@ const char* pattern_to_string(Pattern pattern){
         case custom: return "custom";
         case lines: return "lines";
         case box: return "box";
+        case checkerboard: return "checkerboard";
         case custom_bitmap: return "custom bitmap";
         case string_text: return "string text";
         default: return "unknown";
@@ -748,6 +750,7 @@ void print_help()
     printf("  n: (N)ew user defined color\r\n");
     printf("  l: 5x5 grid of white (L)ines\r\n");
     printf("  x: white bo(X) on black screen\r\n");
+    printf("  h: 5x3 c(H)eckerboard (white centre)\r\n");
     printf("  i: custom b(I)tmap from flash\r\n");
     printf("  f: (F)ont text — %d lines, scale %u\r\n", TEXT_LINES, TEXT_SCALE);
     printf("  F: edit the font text lines\r\n");
@@ -882,6 +885,7 @@ PatternCommand input_get_event(void)
         case 'n':               return CMD_NEW_COLOR;
         case 'l':               return CMD_LINES;
         case 'x':               return CMD_BOX;
+        case 'h':               return CMD_CHECKERBOARD;
         case 'i':               return CMD_CUSTOM_BITMAP;
         case 'f':               return CMD_STRING_TEXT;
         case 'F':               return CMD_EDIT_TEXT;
@@ -1042,6 +1046,7 @@ int main(void) {
             case CMD_ANIMATE: pattern = animate; break;
             case CMD_LINES:   pattern = lines;   break;
             case CMD_BOX:           pattern = box;           break;
+            case CMD_CHECKERBOARD:  pattern = checkerboard;  break;
             case CMD_CUSTOM_BITMAP: pattern = custom_bitmap; break;
             case CMD_STRING_TEXT:   pattern = string_text;   break;
             case CMD_EDIT_TEXT:
@@ -1624,6 +1629,54 @@ static void draw_box_pattern(scanvideo_scanline_buffer_t *buf) {
              pattern_to_color(white),pattern_to_color(black));
 }
 
+// 5x3 (cols x rows) black-and-white checkerboard.  A cell is white when
+// (col + row) is odd, which places white in the centre cell (col 2, row 1)
+// and black in every corner.  Column boundaries are computed with exact
+// integer arithmetic so the emitted columns sum to precisely video_mode.width
+// pixels — a short or long line would desync the timing PIO.
+#define CHECKER_COLS 5u
+#define CHECKER_ROWS 3u
+static void draw_checkerboard(scanvideo_scanline_buffer_t *buffer) {
+    // Need >=3 px per column for a clean COLOR_RUN; too narrow a display can't
+    // show the pattern, so fall back to a black line instead of underflowing.
+    if ((uint)video_mode.width < CHECKER_COLS * 3u) {
+        draw_color_line(buffer, pattern_to_color(black));
+        return;
+    }
+
+    uint line_num = scanvideo_scanline_number(buffer->scanline_id);
+    uint row = (line_num * CHECKER_ROWS) / video_mode.height;
+
+    uint32_t wht = pattern_to_color(white);
+    uint32_t blk = pattern_to_color(black);
+
+    uint16_t *p = (uint16_t *) buffer->data;
+
+    uint prev = 0;
+    for (uint col = 0; col < CHECKER_COLS; col++) {
+        uint next = ((col + 1u) * (uint)video_mode.width) / CHECKER_COLS;
+        uint32_t color = ((col + row) & 1u) ? wht : blk;
+        emit_run(&p, color, next - prev);
+        prev = next;
+    }
+
+    // black pixel to end line
+    *p++ = COMPOSABLE_RAW_1P;
+    *p++ = 0;
+
+    if (((uintptr_t)p) & 3) {
+        *p++ = COMPOSABLE_EOL_ALIGN;
+        *p++ = 0;
+    } else {
+        *p++ = COMPOSABLE_EOL_SKIP_ALIGN;
+        *p++ = 0;
+    }
+
+    buffer->data_used = ((uint32_t *) p) - buffer->data;
+    assert(buffer->data_used < buffer->data_max);
+    buffer->status = SCANLINE_OK;
+}
+
 // Bouncing rectangle animation.  All state is kept as statics so that the
 // function is self-contained and can be called from the dispatch table.
 static void draw_animate(scanvideo_scanline_buffer_t *buf) {
@@ -1695,6 +1748,7 @@ static const draw_fn_t pattern_handlers[max_pattern] = {
     [grey]          = draw_color_shades,
     [lines]         = draw_grid,
     [box]           = draw_box_pattern,
+    [checkerboard]  = draw_checkerboard,
     [custom_bitmap] = draw_flash_bitmap,
     [string_text]   = draw_text_string,
 };
